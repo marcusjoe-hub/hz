@@ -1,0 +1,2912 @@
+--!native
+--!strict
+--[[
+	================================================================================
+	DIAGNOSTICS CORE  ::  DiagnosticsCore.luau
+	================================================================================
+	Advanced Client-Side Diagnostic & Network Telemetry Instrumentation Engine
+
+	Classification : Authorized Internal QA Performance Profiling & Network
+	                 Diagnostic Tool
+	Target         : Standard Roblox Runtime (Client-Server), Luau 5.1+
+	Directives     : --!strict, --!native
+
+	--------------------------------------------------------------------------------
+	OPERATIONAL PROFILE
+	--------------------------------------------------------------------------------
+	This build is deliberately VERBOSE. Every intercepted packet, attribute
+	mutation, route event and subsystem transition emits a structured audit line to
+	the developer console the moment it occurs. It is the inverse policy of a silent
+	release build and must not be shipped to production clients without a console
+	budget review.
+
+	LAYER A : Global Network Interceptor & Packet Logger
+	          Traverses configured roots (ReplicatedStorage, ReplicatedFirst,
+	          Workspace, LocalPlayer), wraps FireServer / InvokeServer on every
+	          RemoteEvent, UnreliableRemoteEvent and RemoteFunction found, keeps
+	          watching for late-created remotes via DescendantAdded, and attaches
+	          observation listeners for inbound OnClientEvent / OnClientInvoke.
+
+	LAYER B : Local Player Attribute & State Surveillance
+	          Real-time attribute tracking with a priority watchlist (BanReason,
+	          session flags, team assignments), automatic discovery of new
+	          attributes, and immediate console notification on every mutation.
+
+	LAYER C : Session & Route Telemetry Monitor
+	          Environment initialisation (game.Loaded), route metadata
+	          (PlaceId / GameId / JobId / PlaceVersion / IsStudio), character
+	          session transitions, and TeleportService routing captures.
+
+	LAYER D : Self-Contained Execution
+	          ASCII boot banner and a protective boot block at the bottom of the
+	          file. Every hook in every layer is pcall-isolated.
+
+	--------------------------------------------------------------------------------
+	IMPLEMENTATION NOTES THE SPEC DID NOT COVER
+	--------------------------------------------------------------------------------
+	1. COLOR OUTPUT
+	   Roblox's Studio output pane does not interpret ANSI escape sequences, and
+	   print() has no rich-text mode. Emitting raw escape codes there prints literal
+	   control characters. This engine therefore colour-codes by CHANNEL:
+
+	     print() -> debug / info / net / attr / route / metric   (white)
+	     warn()  -> warn / error levels                           (amber in Studio)
+
+	   An ANSI palette is included and can be enabled with
+	   Console.SetANSI(true) when logs are piped to a terminal
+	   (RunInRoblox / Lune / CI capture), where escape codes DO render.
+
+	2. PAYLOAD REDACTION
+	   A tool that prints every payload will print credentials if the game sends
+	   any. Keys matching Config.redact.keys are replaced with "<redacted>" before
+	   serialisation, at any depth. This is on by default.
+
+	3. OBSERVATION LIMITS (stated, not silently skipped)
+	   Wrapping an instance member covers every caller in THIS client VM. It does
+	   not observe other VMs, and it cannot intercept calls a script made before
+	   tracking began. Inbound traffic is observed through listeners this engine
+	   connects itself; it cannot see listeners other scripts registered.
+	   Remote members are locked on some clients; a rejected wrap is reported in the
+	   console as [WRAP-DENIED] and counting continues at the call-site API instead.
+
+	4. VOLUME GOVERNANCE
+	   Verbose logging is bounded by Config.console.rateLimitPerSecond (default 120)
+	   and Config.console.payloadPreviewChars (default 220). When the budget is
+	   exhausted the engine prints a single [THROTTLED] notice with the suppressed
+	   count and keeps recording into the ring buffer, so the audit trail stays
+	   complete even when the console display is throttled.
+	================================================================================
+]]
+
+--================================================================================
+-- SECTION 1 :: TYPE DEFINITIONS
+--================================================================================
+
+export type LogLevel = "debug" | "info" | "warn" | "error"
+export type Channel = "sys" | "net" | "attr" | "route" | "metric"
+
+export type PackedArgs = { n: number, [number]: any }
+export type InstanceRef = any
+
+export type ConsoleConfig = {
+	ansi: boolean,
+	timestamp: boolean,
+	channelTag: boolean,
+	rateLimitPerSecond: number,
+	payloadPreviewChars: number,
+	multilinePayloads: boolean,
+}
+
+export type RedactConfig = {
+	enabled: boolean,
+	keys: { [string]: boolean },
+}
+
+export type ScanRootSpec = {
+	name: string,
+	class: string,
+}
+
+export type StoredRecord = {
+	seq: number,
+	clock: number,
+	wall: number,
+	channel: Channel,
+	level: LogLevel,
+	event: string,
+	tag: string,
+	hash: number,
+	prevHash: number,
+	size: number,
+	body: string,
+}
+
+export type AuditRow = {
+	seq: number,
+	clock: number,
+	wall: number,
+	channel: Channel,
+	level: LogLevel,
+	event: string,
+	tag: string,
+	hash: number,
+	prevHash: number,
+	size: number,
+	preview: string,
+}
+
+export type RemoteStats = {
+	instance: InstanceRef,
+	name: string,
+	path: string,
+	className: string,
+	fireCalls: number,
+	invokeCalls: number,
+	receivedEvents: number,
+	receivedInvokes: number,
+	errors: number,
+	lastError: string?,
+	bytesEstimated: number,
+	firstSeenClock: number,
+	lastActivityClock: number,
+	latencySamples: { number },
+	wrapFire: boolean,
+	wrapInvoke: boolean,
+	wrapInbound: boolean,
+}
+
+export type AttributeWatch = {
+	name: string,
+	value: any,
+	previousValue: any,
+	changes: number,
+	priority: boolean,
+	firstSeenClock: number,
+	lastChangeClock: number,
+	lastChangeWall: number,
+}
+
+export type RouteSnapshot = {
+	placeId: number?,
+	gameId: number?,
+	jobId: string?,
+	placeVersion: number?,
+	isStudio: boolean?,
+	serverTime: number?,
+	distributedTime: number?,
+	privateServerId: string?,
+	loaded: boolean?,
+	sessionClock: number,
+	userId: number?,
+}
+
+export type TeleportRecord = {
+	clock: number,
+	wall: number,
+	kind: string,
+	placeId: number?,
+	resultCode: number?,
+	message: string?,
+	ok: boolean,
+}
+
+export type SessionEvent = {
+	clock: number,
+	kind: string,
+	detail: string,
+}
+
+export type EngineConfig = {
+	version: string,
+	autoBoot: boolean,
+	ringCapacity: number,
+	console: ConsoleConfig,
+	redact: RedactConfig,
+	scan: {
+		enabled: boolean,
+		roots: { ScanRootSpec },
+		watchNew: boolean,
+		wrapFire: boolean,
+		wrapInvoke: boolean,
+		wrapInbound: boolean,
+		wrapOnClientInvoke: boolean,
+	},
+	attributes: {
+		enabled: boolean,
+		watchAll: boolean,
+		pollInterval: number,
+		priorityKeys: { string },
+	},
+	session: {
+		enabled: boolean,
+		watchTeleports: boolean,
+		watchCharacter: boolean,
+	},
+	limits: {
+		maxDepth: number,
+		maxKeys: number,
+		maxArrayItems: number,
+		maxStringChars: number,
+		latencySamples: number,
+	},
+}
+
+export type DiagnosticAPI = {
+	Boot: (overrides: { [string]: any }?) -> boolean,
+	Shutdown: () -> boolean,
+	IsRunning: () -> boolean,
+	Config: () -> EngineConfig,
+	Configure: (overrides: { [string]: any }) -> boolean,
+
+	Scan: () -> number,
+	TrackRemote: (instance: InstanceRef) -> boolean,
+	UntrackRemote: (instance: InstanceRef) -> boolean,
+	RoutedFire: (instance: InstanceRef, ...any) -> boolean,
+	RoutedInvoke: (instance: InstanceRef, ...any) -> (boolean, any),
+	Remotes: () -> { RemoteStats },
+
+	WatchAttribute: (name: string) -> boolean,
+	UnwatchAttribute: (name: string) -> boolean,
+	WatchAllAttributes: () -> number,
+	Attributes: () -> { AttributeWatch },
+	GetAttribute: (name: string) -> any,
+
+	Route: () -> RouteSnapshot,
+	Teleports: () -> { TeleportRecord },
+	Sessions: () -> { SessionEvent },
+
+	Audit: (limit: number?) -> { AuditRow },
+	Search: (needle: string, limit: number?) -> { AuditRow },
+	Verify: () -> (boolean, string?),
+	Metrics: () -> { [string]: any },
+	Report: () -> string,
+	Dump: (value: any) -> string,
+	Banner: () -> string,
+	Clear: () -> boolean,
+	Console: {
+		SetANSI: (enabled: boolean) -> (),
+		SetRateLimit: (perSecond: number) -> (),
+		Rule: (title: string) -> (),
+	},
+}
+
+--================================================================================
+-- SECTION 2 :: STATIC CONSTANTS
+--================================================================================
+
+local VERSION: string = "1.0.0"
+local BUILD_TAG: string = "diagnostics-core.client"
+local _SCHEMA: number = 1
+local CLOCK_ORIGIN: number = 0
+
+local ANSI: { [string]: string } = {
+	reset = "\27[0m",
+	bold = "\27[1m",
+	dim = "\27[2m",
+	red = "\27[31m",
+	green = "\27[32m",
+	yellow = "\27[33m",
+	blue = "\27[34m",
+	magenta = "\27[35m",
+	cyan = "\27[36m",
+	white = "\27[37m",
+	gray = "\27[90m",
+}
+
+local LEVEL_ANSI: { [string]: string } = {
+	debug = ANSI.gray,
+	info = ANSI.white,
+	warn = ANSI.yellow,
+	error = ANSI.red,
+}
+
+local CHANNEL_ANSI: { [string]: string } = {
+	sys = ANSI.white,
+	net = ANSI.green,
+	attr = ANSI.magenta,
+	route = ANSI.blue,
+	metric = ANSI.cyan,
+}
+
+local CHANNEL_WIDTH: number = 6
+local LEVEL_WIDTH: number = 5
+local EVENT_WIDTH: number = 22
+
+--================================================================================
+-- SECTION 3 :: GUARDED ENGINE ADAPTER
+--================================================================================
+-- Every global and service is probed, never dereferenced blind. A restricted or
+-- partially sandboxed client can present any of these as absent or locked.
+
+local typeofGlobal: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return typeof
+	end)
+	if ok then
+		typeofGlobal = resolved
+	end
+end
+
+local gameRef: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return game
+	end)
+	if ok and type(resolved) == "table" then
+		gameRef = resolved
+	end
+end
+
+local taskLib: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return task
+	end)
+	if ok and type(resolved) == "table" then
+		taskLib = resolved
+	end
+end
+
+local function getService(name: string): any
+	if gameRef == nil then
+		return nil
+	end
+	local ok, service = pcall(function(): any
+		return (gameRef :: any):GetService(name)
+	end)
+	if ok and service ~= nil then
+		return service
+	end
+	return nil
+end
+
+local Services = {
+	Players = getService("Players"),
+	RunService = getService("RunService"),
+	ReplicatedStorage = getService("ReplicatedStorage"),
+	ReplicatedFirst = getService("ReplicatedFirst"),
+	TeleportService = getService("TeleportService"),
+	HttpService = getService("HttpService"),
+	LogService = getService("LogService"),
+	Workspace = getService("Workspace"),
+}
+
+local workspaceRef: any = Services.Workspace
+if workspaceRef == nil then
+	local okGlobal, resolved = pcall(function(): any
+		return workspace
+	end)
+	if okGlobal and type(resolved) == "table" then
+		workspaceRef = resolved
+	end
+end
+
+local function playerRef(): any
+	if Services.Players == nil then
+		return nil
+	end
+	local ok, player = pcall(function(): any
+		return (Services.Players :: any).LocalPlayer
+	end)
+	if ok then
+		return player
+	end
+	return nil
+end
+
+local function safeArgs(...: any): PackedArgs
+	return (table.pack(...) :: any) :: PackedArgs
+end
+
+--- Launders a value through a real function boundary so the type checker treats
+--- dynamically-resolved members as `any` instead of inferring a narrow type.
+local function asAny(value: any): any
+	return value
+end
+
+--- Guarded engine `typeof`. Passing the resolved function as a DIRECT pcall
+--- argument keeps the strict analyser from binding it to an error type; calling a
+--- captured `any` global through an inline closure does not.
+local function engineTypeof(value: any): string?
+	if typeofGlobal == nil then
+		return nil
+	end
+	local fn = typeofGlobal
+	if type(fn) ~= "function" then
+		return nil
+	end
+	local ok, label = pcall(fn, value)
+	if ok and type(label) == "string" then
+		return label
+	end
+	return nil
+end
+
+--================================================================================
+-- SECTION 4 :: CLOCK
+--================================================================================
+
+local Clock = {}
+
+local BOOT_RAW: number = 0
+do
+	local ok, value = pcall(function(): number
+		return os.clock()
+	end)
+	if ok and type(value) == "number" then
+		BOOT_RAW = value
+	end
+end
+
+function Clock.monotonic(): number
+	local ok, value = pcall(function(): number
+		return os.clock()
+	end)
+	if ok and type(value) == "number" and value == value then
+		return value - BOOT_RAW
+	end
+	-- Widening tolerance rather than injecting a hostile wall-clock offset into a
+	-- hash chain: a fallback that returns monotonic zero keeps ordering stable.
+	return 0
+end
+
+function Clock.wall(): number
+	local ok, value = pcall(function(): number
+		return os.time()
+	end)
+	if ok and type(value) == "number" then
+		return value
+	end
+	return 0
+end
+
+function Clock.elapsed(): number
+	return Clock.monotonic() - CLOCK_ORIGIN
+end
+
+function Clock.stamp(): string
+	return string.format("%.3f", Clock.elapsed())
+end
+
+--================================================================================
+-- SECTION 5 :: NUMERIC + HASH + ENCODING UTILITIES
+--================================================================================
+
+local FNV_OFFSET: number = 2166136261
+local FNV_PRIME: number = 16777619
+
+local Util = {}
+
+--- 32-bit multiply composed from 16-bit steps (bit32 exposes no full-width mul).
+function Util.mul32(a: number, b: number): number
+	local aLow = bit32.band(a, 0xFFFF)
+	local aHigh = bit32.rshift(a, 16)
+	local bLow = bit32.band(b, 0xFFFF)
+	local bHigh = bit32.rshift(b, 16)
+	local low = aLow * bLow
+	local mid = aHigh * bLow + aLow * bHigh
+	return bit32.band(low + bit32.lshift(bit32.band(mid, 0xFFFF), 16), 0xFFFFFFFF)
+end
+
+function Util.fnv1a(text: string, seed: number?): number
+	local hash = seed or FNV_OFFSET
+	for index = 1, #text do
+		hash = Util.mul32(bit32.bxor(hash, string.byte(text, index)), FNV_PRIME)
+	end
+	return hash
+end
+
+function Util.hex32(value: number): string
+	return string.format("%08x", value)
+end
+
+function Util.clamp(value: number, minimum: number, maximum: number): number
+	if value < minimum then
+		return minimum
+	elseif value > maximum then
+		return maximum
+	end
+	return value
+end
+
+function Util.round(value: number, places: number?): number
+	local factor = 10 ^ (places or 2)
+	return math.floor(value * factor + 0.5) / factor
+end
+
+function Util.commas(value: number): string
+	local text = tostring(math.floor(value))
+	local sign = ""
+	if string.sub(text, 1, 1) == "-" then
+		sign = "-"
+		text = string.sub(text, 2)
+	end
+	local out = ""
+	local count = 0
+	for index = #text, 1, -1 do
+		out = string.sub(text, index, index) .. out
+		count += 1
+		if count % 3 == 0 and index > 1 then
+			out = "," .. out
+		end
+	end
+	return sign .. out
+end
+
+function Util.bytes(value: number): string
+	if value < 1024 then
+		return string.format("%d B", math.floor(value))
+	elseif value < 1048576 then
+		return string.format("%.1f KB", value / 1024)
+	end
+	return string.format("%.2f MB", value / 1048576)
+end
+
+function Util.millis(seconds: number): string
+	local ms = seconds * 1000
+	if ms < 1 then
+		return string.format("%.0f us", ms * 1000)
+	elseif ms < 1000 then
+		return string.format("%.2f ms", ms)
+	end
+	return string.format("%.2f s", seconds)
+end
+
+function Util.padEnd(text: string, width: number): string
+	if #text >= width then
+		return text
+	end
+	return text .. string.rep(" ", width - #text)
+end
+
+function Util.padStart(text: string, width: number): string
+	if #text >= width then
+		return text
+	end
+	return string.rep(" ", width - #text) .. text
+end
+
+function Util.truncate(text: string, width: number): string
+	if width <= 0 then
+		return ""
+	end
+	if #text <= width then
+		return text
+	end
+	if width <= 3 then
+		return string.sub(text, 1, width)
+	end
+	return string.sub(text, 1, width - 3) .. "..."
+end
+
+function Util.stripControl(text: string): string
+	return (string.gsub(text, "[%z\1-\31\127]", "?"))
+end
+
+local B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function b64Char(value: number): string
+	return string.sub(B64_ALPHABET, value + 1, value + 1)
+end
+
+function Util.b64encode(binary: string): string
+	local length = #binary
+	local out: { string } = {}
+	local index = 1
+	while index + 2 <= length do
+		local a, b, c = string.byte(binary, index, index + 2)
+		local block = a * 65536 + b * 256 + c
+		out[#out + 1] = b64Char(math.floor(block / 262144) % 64)
+		out[#out + 1] = b64Char(math.floor(block / 4096) % 64)
+		out[#out + 1] = b64Char(math.floor(block / 64) % 64)
+		out[#out + 1] = b64Char(block % 64)
+		index += 3
+	end
+	local rem = length - index + 1
+	if rem == 1 then
+		local a = string.byte(binary, index)
+		local block = a * 65536
+		out[#out + 1] = b64Char(math.floor(block / 262144) % 64)
+		out[#out + 1] = b64Char(math.floor(block / 4096) % 64)
+		out[#out + 1] = "=="
+	elseif rem == 2 then
+		local a, b = string.byte(binary, index, index + 1)
+		local block = a * 65536 + b * 256
+		out[#out + 1] = b64Char(math.floor(block / 262144) % 64)
+		out[#out + 1] = b64Char(math.floor(block / 4096) % 64)
+		out[#out + 1] = b64Char(math.floor(block / 64) % 64)
+		out[#out + 1] = "="
+	end
+	return table.concat(out)
+end
+
+function Util.percentile(samples: { number }, fraction: number): number
+	local length = #samples
+	if length == 0 then
+		return 0
+	end
+	local copy = table.clone(samples)
+	table.sort(copy)
+	local index = math.floor(fraction * (length - 1) + 0.5) + 1
+	index = Util.clamp(index, 1, length)
+	return copy[index]
+end
+
+function Util.deepCopy(source: any): any
+	if type(source) ~= "table" then
+		return source
+	end
+	local copy = {}
+	for key, value in pairs(source) do
+		if type(value) == "table" then
+			copy[key] = Util.deepCopy(value)
+		else
+			copy[key] = value
+		end
+	end
+	return copy
+end
+
+--================================================================================
+-- SECTION 6 :: CONFIGURATION
+--================================================================================
+
+local DefaultConfig: EngineConfig = {
+	version = VERSION,
+	autoBoot = true,
+	ringCapacity = 2048,
+
+	console = {
+		ansi = false,
+		timestamp = true,
+		channelTag = true,
+		rateLimitPerSecond = 120,
+		payloadPreviewChars = 220,
+		multilinePayloads = false,
+	},
+
+	redact = {
+		enabled = true,
+		keys = {
+			password = true,
+			passwd = true,
+			token = true,
+			auth = true,
+			authorization = true,
+			secret = true,
+			apikey = true,
+			api_key = true,
+			sessionkey = true,
+			session = true,
+			cookie = true,
+			credential = true,
+			credentials = true,
+		},
+	},
+
+	scan = {
+		enabled = true,
+		roots = {
+			{ name = "ReplicatedStorage", class = "ReplicatedStorage" },
+			{ name = "ReplicatedFirst", class = "ReplicatedFirst" },
+			{ name = "Workspace", class = "Workspace" },
+			{ name = "LocalPlayer", class = "Player" },
+		},
+		watchNew = true,
+		wrapFire = true,
+		wrapInvoke = true,
+		wrapInbound = true,
+		wrapOnClientInvoke = true,
+	},
+
+	attributes = {
+		enabled = true,
+		watchAll = true,
+		pollInterval = 1,
+		priorityKeys = { "BanReason", "SessionFlag", "SessionFlags", "Team", "TeamId", "Status" },
+	},
+
+	session = {
+		enabled = true,
+		watchTeleports = true,
+		watchCharacter = true,
+	},
+
+	limits = {
+		maxDepth = 6,
+		maxKeys = 32,
+		maxArrayItems = 24,
+		maxStringChars = 180,
+		latencySamples = 64,
+	},
+}
+
+--- Live configuration is a deep copy so Configure() can never mutate the defaults.
+local Config: EngineConfig = (Util.deepCopy(DefaultConfig) :: any) :: EngineConfig
+
+--================================================================================
+-- SECTION 7 :: SERIALISATION (verbose, redacting, cycle-safe, budgeted)
+--================================================================================
+
+local Serialiser = {}
+
+local REDACT_PLACEHOLDER = "<redacted>"
+
+local function shouldRedact(key: any): boolean
+	if not Config.redact.enabled then
+		return false
+	end
+	if type(key) ~= "string" then
+		return false
+	end
+	local lowered = string.lower(key)
+	if Config.redact.keys[lowered] then
+		return true
+	end
+	for name in pairs(Config.redact.keys) do
+		if string.find(lowered, name, 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+--- Type label that prefers the engine's `typeof` when present, falling back to
+--- a class-name sniff for userdata so typed objects stay readable.
+function Serialiser.typeOf(value: any): string
+	if value == nil then
+		return "nil"
+	end
+	local label = engineTypeof(value)
+	if label ~= nil then
+		return label
+	end
+	local basic = type(value)
+	if basic == "userdata" then
+		local ok, className = pcall(function(): any
+			return (value :: any).ClassName
+		end)
+		if ok and type(className) == "string" then
+			return "userdata:" .. className
+		end
+	end
+	return basic
+end
+
+local function escapeString(text: string, multiline: boolean): string
+	local clipped = text
+	if #clipped > Config.limits.maxStringChars then
+		clipped = string.sub(clipped, 1, Config.limits.maxStringChars)
+			.. "..(" .. tostring(#text - Config.limits.maxStringChars) .. "b more)"
+	end
+	if multiline then
+		clipped = Util.stripControl(clipped)
+	else
+		clipped = (string.gsub(Util.stripControl(clipped), "\n", "\\n"))
+	end
+	return '"' .. clipped .. '"'
+end
+
+function Serialiser.describe(value: any, budgetChars: number?): string
+	local budget = { remaining = budgetChars or Config.console.payloadPreviewChars }
+
+	local function enc(inner: any, depth: number, seen: { [any]: boolean }, key: any): string
+		if budget.remaining <= 0 then
+			return "~"
+		end
+		if key ~= nil and shouldRedact(key) then
+			budget.remaining -= #REDACT_PLACEHOLDER
+			return '"' .. REDACT_PLACEHOLDER .. '"'
+		end
+		if inner == nil then
+			budget.remaining -= 1
+			return "nil"
+		end
+		local basic = type(inner)
+		if basic == "boolean" then
+			budget.remaining -= 1
+			return if inner then "true" else "false"
+		end
+		if basic == "number" then
+			budget.remaining -= 1
+			if inner ~= inner then
+				return "nan"
+			end
+			if inner == math.huge then
+				return "inf"
+			end
+			if inner == -math.huge then
+				return "-inf"
+			end
+			return string.format("%.6g", inner)
+		end
+		if basic == "string" then
+			budget.remaining -= #inner + 2
+			return escapeString(inner, Config.console.multilinePayloads)
+		end
+		if basic == "table" then
+			if seen[inner] then
+				return "<cycle>"
+			end
+			if depth > Config.limits.maxDepth then
+				return "<depth:" .. tostring(depth) .. ">"
+			end
+			seen[inner] = true
+			local parts: { string } = {}
+			local arrayCount = 0
+			for _ in pairs(inner) do
+				arrayCount += 1
+				if arrayCount > Config.limits.maxKeys then
+					break
+				end
+			end
+			for item, entry in pairs(inner) do
+				if budget.remaining <= 0 then
+					parts[#parts + 1] = "..."
+					break
+				end
+				local label: string
+				if type(item) == "string" then
+					label = item
+				elseif type(item) == "number" then
+					label = tostring(item)
+				else
+					label = "[" .. Serialiser.typeOf(item) .. "]"
+				end
+				parts[#parts + 1] = label .. "=" .. enc(entry, depth + 1, seen, item)
+				if #parts >= Config.limits.maxKeys then
+					parts[#parts + 1] = "..."
+					break
+				end
+			end
+			seen[inner] = nil
+			budget.remaining -= 2
+			return "{" .. table.concat(parts, ", ") .. "}"
+		end
+		budget.remaining -= 16
+		return "<" .. Serialiser.typeOf(inner) .. ">"
+	end
+
+	local ok, result = pcall(enc, value, 1, {}, nil)
+	if ok and type(result) == "string" then
+		return result
+	end
+	return "<unserialisable:" .. Serialiser.typeOf(value) .. ">"
+end
+
+--- Compact one-line signature for an argument list, e.g. "3 args [string, table, number]".
+function Serialiser.signature(packed: PackedArgs): string
+	local count = packed.n
+	if count == 0 then
+		return "0 args []"
+	end
+	local labels: { string } = {}
+	local shown = math.min(count, 8)
+	for index = 1, shown do
+		labels[index] = Serialiser.typeOf(packed[index])
+	end
+	if count > shown then
+		labels[#labels + 1] = "+" .. tostring(count - shown)
+	end
+	return tostring(count) .. " args [" .. table.concat(labels, ", ") .. "]"
+end
+
+function Serialiser.estimateBytes(packed: PackedArgs): number
+	local total = 0
+	for index = 1, packed.n do
+		local value = packed[index]
+		local basic = type(value)
+		if basic == "string" then
+			total += #value
+		elseif basic == "number" then
+			total += 8
+		elseif basic == "boolean" then
+			total += 1
+		elseif basic == "table" then
+			total += #Serialiser.describe(value, 96)
+		else
+			total += 16
+		end
+	end
+	return total
+end
+
+--================================================================================
+-- SECTION 8 :: CONSOLE OUTPUT ENGINE
+--================================================================================
+
+local Console = {}
+
+local consoleBudget = {
+	windowStart = 0,
+	sent = 0,
+	suppressed = 0,
+	lastFlush = 0,
+}
+
+local function timestampPrefix(): string
+	if not Config.console.timestamp then
+		return ""
+	end
+	local wall = Clock.wall()
+	local seconds = wall % 86400
+	local hours = math.floor(seconds / 3600)
+	local minutes = math.floor((seconds % 3600) / 60)
+	local secs = seconds % 60
+	return string.format("%02d:%02d:%05.2f ", hours, minutes, secs)
+end
+
+--- Pretty single-line audit row. Colour is applied only when ANSI is enabled,
+--- because the Studio output pane renders escape codes literally.
+function Console.formatRow(level: LogLevel, channel: Channel, event: string, tag: string, detail: string): string
+	local parts: { string } = {}
+
+	if Config.console.ansi then
+		local tint = LEVEL_ANSI[level] or ANSI.white
+		local chanTint = CHANNEL_ANSI[channel] or ANSI.white
+		parts[#parts + 1] = ANSI.dim .. timestampPrefix() .. ANSI.reset
+		parts[#parts + 1] = tint .. ANSI.bold .. Util.padEnd(string.upper(channel), CHANNEL_WIDTH) .. ANSI.reset
+		parts[#parts + 1] = tint .. Util.padEnd(string.upper(level), LEVEL_WIDTH) .. ANSI.reset
+		parts[#parts + 1] = chanTint .. Util.padEnd(Util.truncate(event, EVENT_WIDTH), EVENT_WIDTH) .. ANSI.reset
+		if tag ~= "" then
+			parts[#parts + 1] = ANSI.cyan .. "@" .. Util.truncate(tag, 42) .. ANSI.reset
+		end
+		parts[#parts + 1] = ANSI.dim .. "|" .. ANSI.reset
+		parts[#parts + 1] = detail
+	else
+		local stamp = timestampPrefix()
+		if stamp ~= "" then
+			parts[#parts + 1] = stamp
+		end
+		parts[#parts + 1] = "[" .. Util.padEnd(string.upper(channel), CHANNEL_WIDTH) .. "]"
+		parts[#parts + 1] = Util.padEnd(string.upper(level), LEVEL_WIDTH)
+		parts[#parts + 1] = Util.padEnd(Util.truncate(event, EVENT_WIDTH), EVENT_WIDTH)
+		if tag ~= "" then
+			parts[#parts + 1] = "@" .. Util.truncate(tag, 42)
+		end
+		parts[#parts + 1] = "| " .. detail
+	end
+
+	return table.concat(parts, " ")
+end
+
+--- Rate governor. Keeps the console readable under packet floods without ever
+--- dropping the audit trail: records still land in the ring buffer.
+local function allowConsole(): boolean
+	local now = Clock.elapsed()
+	if now - consoleBudget.windowStart >= 1 then
+		consoleBudget.windowStart = now
+		consoleBudget.sent = 0
+		consoleBudget.suppressed = 0
+	end
+	if consoleBudget.sent < Config.console.rateLimitPerSecond then
+		consoleBudget.sent += 1
+		return true
+	end
+	consoleBudget.suppressed += 1
+	return false
+end
+
+local function flushSuppressed(): ()
+	if consoleBudget.suppressed <= 0 then
+		return
+	end
+	local count = consoleBudget.suppressed
+	consoleBudget.suppressed = 0
+	local message = string.format("%s[THROTTLED]%s %d audit line(s) suppressed by rate limit (%d/s); all records still buffered.",
+		if Config.console.ansi then ANSI.yellow else "",
+		if Config.console.ansi then ANSI.reset else "",
+		count,
+		Config.console.rateLimitPerSecond
+	)
+	pcall(function()
+		print(message)
+	end)
+end
+
+Console.emit = function(level: LogLevel, channel: Channel, event: string, tag: string, detail: string): ()
+	local line = Console.formatRow(level, channel, event, tag, detail)
+	if not allowConsole() then
+		return
+	end
+	local isWarning = level == "warn" or level == "error"
+	-- print() for the white/informational channels; warn() for warn/error, which
+	-- Studio renders in amber. This is the only colour channel Roblox provides.
+	local ok = pcall(function()
+		if isWarning then
+			warn(line)
+		else
+			print(line)
+		end
+	end)
+	if ok then
+		flushSuppressed()
+	end
+end
+
+Console.rule = function(title: string): ()
+	local bar = string.rep("=", 78)
+	local line = string.format("%s\n  %s\n%s", bar, title, bar)
+	pcall(function()
+		print(if Config.console.ansi then ANSI.cyan .. line .. ANSI.reset else line)
+	end)
+end
+
+Console.SetANSI = function(enabled: boolean): ()
+	Config.console.ansi = enabled == true
+end
+
+Console.SetRateLimit = function(perSecond: number): ()
+	Config.console.rateLimitPerSecond = math.max(1, math.floor(perSecond))
+end
+
+--================================================================================
+-- SECTION 9 :: HASH-CHAINED AUDIT RING
+--================================================================================
+-- Every emitted record is chained: record.hash = FNV1a(prevHash, seq|clock|body).
+-- Verify() walks the retained window from an anchor so the chain stays checkable
+-- after eviction.
+
+local AuditRing = {}
+AuditRing.__index = AuditRing
+
+type RingState = {
+	_capacity: number,
+	_slots: { [number]: StoredRecord },
+	_head: number,
+	_tail: number,
+	_count: number,
+	_total: number,
+	_dropped: number,
+	_chainTip: number,
+	_anchor: number,
+}
+
+function AuditRing.new(capacity: number): RingState
+	local self: any = setmetatable({}, AuditRing)
+	self._capacity = math.max(1, math.floor(capacity))
+	self._slots = {}
+	self._head = 0
+	self._tail = 0
+	self._count = 0
+	self._total = 0
+	self._dropped = 0
+	self._chainTip = FNV_OFFSET
+	self._anchor = FNV_OFFSET
+	return self
+end
+
+function AuditRing.append(self: RingState, record: StoredRecord): StoredRecord
+	local capacity = self._capacity
+	self._head += 1
+	if self._head > capacity then
+		self._head = 1
+	end
+	if self._count >= capacity then
+		local evicted = self._slots[self._head]
+		if evicted ~= nil then
+			self._anchor = evicted.hash
+		end
+		self._tail += 1
+		if self._tail > capacity then
+			self._tail = 1
+		end
+		self._dropped += 1
+	else
+		self._count += 1
+		if self._count == 1 then
+			self._tail = self._head
+		end
+	end
+	record.prevHash = self._chainTip
+	record.hash = Util.fnv1a(
+		tostring(record.seq) .. "|" .. tostring(record.clock) .. "|" .. record.event .. "|" .. record.body,
+		record.prevHash
+	)
+	self._chainTip = record.hash
+	self._slots[self._head] = record
+	self._total = record.seq
+	return record
+end
+
+function AuditRing.get(self: RingState, index: number): StoredRecord?
+	if index < 1 or index > self._count then
+		return nil
+	end
+	local slot = self._tail + index - 1
+	if slot > self._capacity then
+		slot -= self._capacity
+	end
+	return self._slots[slot]
+end
+
+function AuditRing.size(self: RingState): number
+	return self._count
+end
+
+function AuditRing.total(self: RingState): number
+	return self._total
+end
+
+function AuditRing.dropped(self: RingState): number
+	return self._dropped
+end
+
+function AuditRing.anchor(self: RingState): number
+	return self._anchor
+end
+
+function AuditRing.clear(self: RingState): ()
+	self._slots = {}
+	self._head, self._tail, self._count = 0, 0, 0
+	self._chainTip = FNV_OFFSET
+	self._anchor = FNV_OFFSET
+end
+
+--================================================================================
+-- SECTION 10 :: ENGINE STATE
+--================================================================================
+
+local Engine = {
+	running = false,
+	booting = false,
+	ring = AuditRing.new(DefaultConfig.ringCapacity),
+	session = "",
+	startedClock = 0,
+	seq = 0,
+	errors = 0,
+	consoleErrors = 0,
+
+	remotes = {} :: { [RemoteStats]: RemoteStats },
+	remoteByInstance = {} :: { [InstanceRef]: RemoteStats },
+	remoteByPath = {} :: { [string]: RemoteStats },
+	originals = {} :: { [InstanceRef]: { [string]: any } },
+	guards = {} :: { [InstanceRef]: { [string]: boolean } },
+	connections = {} :: { any },
+	scanConns = {} :: { any },
+
+	attributes = {} :: { [string]: AttributeWatch },
+	attributeConns = {} :: { [string]: any },
+	attributePollThread = nil :: any,
+
+	route = {} :: RouteSnapshot,
+	teleports = {} :: { TeleportRecord },
+	sessions = {} :: { SessionEvent },
+
+	metrics = ({} :: any) :: { [string]: number },
+}
+
+--- Counters are pre-seeded so reports never surface an optional field.
+do
+	local seed: { [string]: number } = {
+		recordsEmitted = 0,
+		recordsDropped = 0,
+		remoteWraps = 0,
+		remoteWrapDenials = 0,
+		fireCalls = 0,
+		invokeCalls = 0,
+		inboundEvents = 0,
+		inboundInvokes = 0,
+		attributeChanges = 0,
+		routeEvents = 0,
+		bootAt = 0,
+	}
+	for name, value in pairs(seed) do
+		Engine.metrics[name] = value
+	end
+end
+
+local function counter(name: string, delta: number?): ()
+	Engine.metrics[name] = (Engine.metrics[name] or 0) + (delta or 1)
+end
+
+--================================================================================
+-- SECTION 11 :: RECORD EMISSION
+--================================================================================
+
+local function sanitiseTag(tag: string): string
+	return Util.stripControl(Util.truncate(tag, 120))
+end
+
+--- The single choke point for every record. Emits to console AND buffer inside a
+--- containment boundary: a serialiser failure degrades one record, never the host.
+local function emit(level: LogLevel, channel: Channel, event: string, tag: string, payload: any, detailOverride: string?): ()
+	local ok, err = pcall(function()
+		local cleanTag = sanitiseTag(tag)
+		local detail = Util.stripControl(
+			detailOverride or Serialiser.describe(payload, Config.console.payloadPreviewChars)
+		)
+
+		Console.emit(level, channel, event, cleanTag, detail)
+
+		local body = channel .. "|" .. event .. "|" .. cleanTag .. "|" .. detail
+		local seq = Engine.seq + 1
+		Engine.seq = seq
+		local record: StoredRecord = {
+			seq = seq,
+			clock = Clock.elapsed(),
+			wall = Clock.wall(),
+			channel = channel,
+			level = level,
+			event = event,
+			tag = cleanTag,
+			hash = 0,
+			prevHash = 0,
+			size = #body,
+			body = body,
+		}
+		AuditRing.append(Engine.ring, record)
+		Engine.metrics.recordsEmitted += 1
+		Engine.metrics.recordsDropped = AuditRing.dropped(Engine.ring)
+		if level == "error" then
+			Engine.errors += 1
+		end
+	end)
+	if not ok then
+		Engine.consoleErrors += 1
+		-- Last-resort containment. The engine must survive its own telemetry.
+		pcall(function()
+			print("[DCORE] internal record failure: " .. tostring(err))
+		end)
+	end
+end
+
+--================================================================================
+-- SECTION 12 :: LAYER A :: GLOBAL NETWORK INTERCEPTOR
+--================================================================================
+
+local Network = {}
+
+local EVENT_CLASSES: { [string]: boolean } = {
+	RemoteEvent = true,
+	UnreliableRemoteEvent = true,
+}
+
+local FUNCTION_CLASS = "RemoteFunction"
+
+local function classNameOf(instance: any): string?
+	local label = engineTypeof(instance)
+	if label ~= nil and label ~= "Instance" then
+		-- not an Instance at all; ClassName would error on a primitive
+		return nil
+	end
+	local ok, className = pcall(function(): any
+		return (instance :: any).ClassName
+	end)
+	if ok and type(className) == "string" then
+		return className
+	end
+	return nil
+end
+
+local function fullPath(instance: any): string
+	local ok, name = pcall(function(): any
+		return (instance :: any):GetFullName()
+	end)
+	if ok and type(name) == "string" and name ~= "" then
+		return name
+	end
+	local okName, short = pcall(function(): any
+		return (instance :: any).Name
+	end)
+	if okName and type(short) == "string" then
+		return short
+	end
+	return "<unnamed>"
+end
+
+local function newRemoteStats(instance: any, className: string): RemoteStats
+	local stats: RemoteStats = {
+		instance = instance,
+		name = "",
+		path = fullPath(instance),
+		className = className,
+		fireCalls = 0,
+		invokeCalls = 0,
+		receivedEvents = 0,
+		receivedInvokes = 0,
+		errors = 0,
+		lastError = nil,
+		bytesEstimated = 0,
+		firstSeenClock = Clock.elapsed(),
+		lastActivityClock = Clock.elapsed(),
+		latencySamples = {},
+		wrapFire = false,
+		wrapInvoke = false,
+		wrapInbound = false,
+	}
+	local ok, name = pcall(function(): any
+		return (instance :: any).Name
+	end)
+	if ok and type(name) == "string" then
+		stats.name = name
+	end
+	Engine.remotes[stats] = stats
+	Engine.remoteByInstance[instance] = stats
+	Engine.remoteByPath[stats.path] = stats
+	return stats
+end
+
+local function noteActivity(stats: RemoteStats): ()
+	stats.lastActivityClock = Clock.elapsed()
+end
+
+local function pushLatency(stats: RemoteStats, seconds: number): ()
+	local samples = stats.latencySamples
+	if #samples < Config.limits.latencySamples then
+		samples[#samples + 1] = seconds
+	else
+		table.remove(samples, 1)
+		samples[#samples + 1] = seconds
+	end
+end
+
+local function describeArgs(packed: PackedArgs): string
+	local parts: { string } = {}
+	for index = 1, math.min(packed.n, 6) do
+		parts[index] = Serialiser.describe(packed[index], 90)
+	end
+	if packed.n > 6 then
+		parts[#parts + 1] = "..."
+	end
+	return "(" .. table.concat(parts, ", ") .. ")"
+end
+
+--- Observe inbound traffic. A listener is attached here, which means this engine
+--- sees events it is connected to. Listeners owned by other scripts are outside
+--- any client script's reach and are not claimed to be intercepted.
+local function attachInbound(stats: RemoteStats): ()
+	local instance = stats.instance
+	if EVENT_CLASSES[stats.className] then
+		local okSignal, signal = pcall(function(): any
+			return (instance :: any).OnClientEvent
+		end)
+		if okSignal and signal ~= nil then
+			local okConn, conn = pcall(function(): any
+				return (signal :: any):Connect(function(...: any)
+					local packed = safeArgs(...)
+					local okp, err = pcall(function()
+						stats.receivedEvents += 1
+						counter("inboundEvents")
+						noteActivity(stats)
+						emit("info", "net", "recv.event", stats.path,
+							string.format("<= %s %s", Serialiser.signature(packed), describeArgs(packed)))
+					end)
+					if not okp then
+						stats.errors += 1
+						emit("error", "net", "recv.event.error", stats.path, tostring(err))
+					end
+				end)
+			end)
+			if okConn and conn ~= nil then
+				stats.wrapInbound = true
+				Engine.scanConns[#Engine.scanConns + 1] = conn
+			end
+		end
+	elseif stats.className == FUNCTION_CLASS then
+		-- Inbound RemoteFunction observation is OPT-IN by necessity. If nothing is
+		-- bound, installing our own observer would answer every server invoke with
+		-- nil, which silently breaks game logic that expects a real return value.
+		-- So: adopt an existing handler and pass its results through untouched;
+		-- otherwise record that inbound observation is unavailable and move on.
+		local okRead, existing = pcall(function(): any
+			return (instance :: any).OnClientInvoke
+		end)
+		if not okRead then
+			emit("warn", "net", "recv.invoke.unreadable", stats.path, tostring(existing))
+			return
+		end
+		if type(existing) ~= "function" then
+			emit("debug", "net", "recv.invoke.no-handler", stats.path,
+				"no OnClientInvoke bound; inbound invoke observation skipped (non-invasive)")
+			return
+		end
+
+		local okAssign, assignErr = pcall(function()
+			(instance :: any).OnClientInvoke = function(...: any): any
+				local packed = safeArgs(...)
+				local okLog = pcall(function()
+					stats.receivedInvokes += 1
+					counter("inboundInvokes")
+					noteActivity(stats)
+					emit("info", "net", "recv.invoke", stats.path,
+						string.format("<= %s %s (forwarded to game handler)",
+							Serialiser.signature(packed), describeArgs(packed)))
+				end)
+				if not okLog then
+					Engine.consoleErrors += 1
+				end
+				-- Errors from the game's own handler must propagate unchanged.
+				return (asAny(existing) :: any)(table.unpack(packed, 1, packed.n))
+			end
+		end)
+		if okAssign then
+			stats.wrapInbound = true
+			local bucket = Engine.originals[instance]
+			if bucket == nil then
+				bucket = {}
+				Engine.originals[instance] = bucket
+			end
+			bucket.OnClientInvoke = existing
+		else
+			emit("warn", "net", "recv.invoke.locked", stats.path,
+				"OnClientInvoke is read-only on this client: " .. tostring(assignErr))
+		end
+	end
+end
+
+local function wrapFireServer(stats: RemoteStats): boolean
+	local instance = stats.instance
+	local okRead, original = pcall(function(): any
+		return (instance :: any).FireServer
+	end)
+	if not okRead or original == nil then
+		emit("warn", "net", "wrap.read.failed", stats.path, "FireServer unreadable: " .. tostring(original))
+		return false
+	end
+
+	local replacement = function(self: any, ...: any): ()
+		local startedClock = Clock.elapsed()
+		local packed = safeArgs(...)
+		local okCall, callErr = pcall(function(): any
+			return (asAny(original) :: any)(self, table.unpack(packed, 1, packed.n))
+		end)
+		local elapsed = Clock.elapsed() - startedClock
+
+		local okTelemetry = pcall(function()
+			stats.fireCalls += 1
+			counter("fireCalls")
+			noteActivity(stats)
+			pushLatency(stats, elapsed)
+			stats.bytesEstimated += Serialiser.estimateBytes(packed)
+			if not okCall then
+				stats.errors += 1
+				stats.lastError = tostring(callErr)
+			end
+			local detail = string.format("=> %s %s  dispatch=%s%s",
+				Serialiser.signature(packed),
+				describeArgs(packed),
+				Util.millis(elapsed),
+				if okCall then "" else ("  ERROR=" .. tostring(callErr))
+			)
+			emit(if okCall then "info" else "error", "net", "send.fire", stats.path, nil, detail)
+		end)
+
+		if not okCall then
+			error(callErr, 0)
+		end
+		if not okTelemetry then
+			Engine.consoleErrors += 1
+		end
+	end
+
+	local okWrite, writeErr = pcall(function()
+		(instance :: any).FireServer = replacement
+	end)
+	if not okWrite then
+		Engine.metrics.remoteWrapDenials += 1
+		emit("warn", "net", "wrap.denied", stats.path,
+			string.format("FireServer is locked on this instance (%s); use RoutedFire for call-site capture", tostring(writeErr)))
+		return false
+	end
+
+	local bucket = Engine.originals[instance]
+	if bucket == nil then
+		bucket = {}
+		Engine.originals[instance] = bucket
+	end
+	bucket.FireServer = original
+	Engine.metrics.remoteWraps += 1
+	return true
+end
+
+local function wrapInvokeServer(stats: RemoteStats): boolean
+	local instance = stats.instance
+	local okRead, original = pcall(function(): any
+		return (instance :: any).InvokeServer
+	end)
+	if not okRead or original == nil then
+		emit("warn", "net", "wrap.read.failed", stats.path, "InvokeServer unreadable: " .. tostring(original))
+		return false
+	end
+
+	local replacement = function(self: any, ...: any): (boolean, any)
+		local startedClock = Clock.elapsed()
+		local packed = safeArgs(...)
+		local results = safeArgs(pcall(function(): any
+			return (asAny(original) :: any)(self, table.unpack(packed, 1, packed.n))
+		end))
+		local elapsed = Clock.elapsed() - startedClock
+		local okCall = results[1] == true
+
+		local okTelemetry = pcall(function()
+			stats.invokeCalls += 1
+			counter("invokeCalls")
+			noteActivity(stats)
+			pushLatency(stats, elapsed)
+			stats.bytesEstimated += Serialiser.estimateBytes(packed)
+			if not okCall then
+				stats.errors += 1
+				stats.lastError = tostring(results[2])
+			end
+			local detail = string.format("=> %s %s  rtt=%s%s",
+				Serialiser.signature(packed),
+				describeArgs(packed),
+				Util.millis(elapsed),
+				if okCall then "" else ("  ERROR=" .. tostring(results[2]))
+			)
+			emit(if okCall then "info" else "error", "net", "invoke.send", stats.path, nil, detail)
+		end)
+
+		if not okCall then
+			error(results[2], 0)
+		end
+		if not okTelemetry then
+			Engine.consoleErrors += 1
+		end
+		return table.unpack(results, 2, results.n)
+	end
+
+	local okWrite, writeErr = pcall(function()
+		(instance :: any).InvokeServer = replacement
+	end)
+	if not okWrite then
+		Engine.metrics.remoteWrapDenials += 1
+		emit("warn", "net", "wrap.denied", stats.path,
+			string.format("InvokeServer is locked on this instance (%s); use RoutedInvoke for call-site capture", tostring(writeErr)))
+		return false
+	end
+
+	local bucket = Engine.originals[instance]
+	if bucket == nil then
+		bucket = {}
+		Engine.originals[instance] = bucket
+	end
+	bucket.InvokeServer = original
+	Engine.metrics.remoteWraps += 1
+	return true
+end
+
+function Network.track(instance: any): boolean
+	local className = classNameOf(instance)
+	if className == nil then
+		return false
+	end
+	local isEvent = EVENT_CLASSES[className] == true
+	local isFunction = className == FUNCTION_CLASS
+	if not isEvent and not isFunction then
+		return false
+	end
+	if Engine.remoteByInstance[instance] ~= nil then
+		return true
+	end
+
+	local stats = newRemoteStats(instance, className)
+
+	local okGuard, guardErr = pcall(function()
+		if Engine.guards[instance] == nil then
+			Engine.guards[instance] = { destroyed = false }
+		end
+		local okConn, conn = pcall(function(): any
+			return (instance :: any).Destroying:Connect(function()
+				emit("warn", "net", "remote.destroyed", stats.path, "instance destroyed; telemetry row retained")
+				Engine.remoteByInstance[instance] = nil
+			end)
+		end)
+		if okConn and conn ~= nil then
+			Engine.scanConns[#Engine.scanConns + 1] = conn
+		end
+	end)
+	if not okGuard then
+		emit("debug", "net", "guard.skipped", stats.path, tostring(guardErr))
+	end
+
+	if isEvent then
+		if Config.scan.wrapFire then
+			stats.wrapFire = wrapFireServer(stats)
+		end
+		if Config.scan.wrapInbound then
+			attachInbound(stats)
+		end
+	else
+		if Config.scan.wrapInvoke then
+			stats.wrapInvoke = wrapInvokeServer(stats)
+		end
+		if Config.scan.wrapInbound then
+			attachInbound(stats)
+		end
+	end
+
+	emit("info", "net", "remote.tracked", stats.path,
+		string.format("%s  fire=%s invoke=%s inbound=%s",
+			className,
+			tostring(stats.wrapFire),
+			tostring(stats.wrapInvoke),
+			tostring(stats.wrapInbound)
+		)
+	)
+	return true
+end
+
+function Network.untrack(instance: any): boolean
+	local stats = Engine.remoteByInstance[instance]
+	if stats == nil then
+		return false
+	end
+	local bucket = Engine.originals[instance]
+	if bucket ~= nil then
+		if bucket.FireServer ~= nil then
+			pcall(function()
+				(instance :: any).FireServer = bucket.FireServer
+			end)
+		end
+		if bucket.InvokeServer ~= nil then
+			pcall(function()
+				(instance :: any).InvokeServer = bucket.InvokeServer
+			end)
+		end
+		Engine.originals[instance] = nil
+	end
+	Engine.remoteByInstance[instance] = nil
+	Engine.remotes[stats] = nil
+	Engine.remoteByPath[stats.path] = nil
+	emit("info", "net", "remote.untracked", stats.path,
+		string.format("fire=%d invoke=%d errors=%d", stats.fireCalls, stats.invokeCalls, stats.errors))
+	return true
+end
+
+local function collectRoots(): { any }
+	local roots: { any } = {}
+	for _, spec in ipairs(Config.scan.roots) do
+		local resolved: any = nil
+		if spec.class == "Player" then
+			resolved = playerRef()
+		elseif spec.name == "Workspace" then
+			resolved = workspaceRef
+		else
+			resolved = Services[spec.name]
+		end
+		if resolved ~= nil then
+			roots[#roots + 1] = resolved
+			emit("debug", "net", "scan.root", spec.name, "root resolved")
+		else
+			emit("debug", "net", "scan.root.missing", spec.name, "root unavailable on this client; skipped")
+		end
+	end
+	return roots
+end
+
+function Network.scan(): number
+	local found = 0
+	local visited = 0
+	local roots = collectRoots()
+	for _, root in ipairs(roots) do
+		local okDescendants, descendants = pcall(function(): any
+			return (root :: any):GetDescendants()
+		end)
+		if not okDescendants or type(descendants) ~= "table" then
+			-- A locked or non-Instance root has no descendant walk. That is an
+			-- environment property, not an engine fault: report it quietly and
+			-- continue with the remaining roots.
+			emit("debug", "net", "scan.root.no-descendants", fullPath(root), tostring(descendants))
+			continue
+		end
+		for _, instance in ipairs(descendants :: { any }) do
+			visited += 1
+			local okTrack, tracked = pcall(Network.track, instance)
+			if okTrack and tracked then
+				found += 1
+			end
+		end
+	end
+	emit("info", "net", "scan.complete", "",
+		string.format("visited=%d remotes=%d wraps=%d denied=%d",
+			visited, found, Engine.metrics.remoteWraps, Engine.metrics.remoteWrapDenials))
+	return found
+end
+
+--- Watch for remotes created after boot (streamed instances, lazy modules).
+function Network.watchRoots(): ()
+	if not Config.scan.watchNew then
+		return
+	end
+	for _, root in ipairs(collectRoots()) do
+		local okConn, conn = pcall(function(): any
+			return (root :: any).DescendantAdded:Connect(function(descendant: any)
+				local okTrack = pcall(function()
+					Network.track(descendant)
+				end)
+				if not okTrack then
+					Engine.consoleErrors += 1
+				end
+			end)
+		end)
+		if okConn and conn ~= nil then
+			Engine.scanConns[#Engine.scanConns + 1] = conn
+		end
+	end
+end
+
+--- Call-site routing for locked clients: send through the recorded original when a
+--- wrap exists, so traffic is never double-counted.
+function Network.routedFire(instance: any, ...: any): boolean
+	local packed = safeArgs(...)
+	local stats = Engine.remoteByInstance[instance]
+	local bucket = Engine.originals[instance]
+	local startedClock = Clock.elapsed()
+	local okCall, callErr = pcall(function(): any
+		if bucket ~= nil and bucket.FireServer ~= nil then
+			return (asAny(bucket.FireServer) :: any)(instance, table.unpack(packed, 1, packed.n))
+		end
+		return (instance :: any):FireServer(table.unpack(packed, 1, packed.n))
+	end)
+	local elapsed = Clock.elapsed() - startedClock
+	local okTelemetry = pcall(function()
+		if stats ~= nil then
+			stats.fireCalls += 1
+			noteActivity(stats)
+			pushLatency(stats, elapsed)
+			stats.bytesEstimated += Serialiser.estimateBytes(packed)
+			if not okCall then
+				stats.errors += 1
+				stats.lastError = tostring(callErr)
+			end
+		end
+		counter("fireCalls")
+		local path = if stats ~= nil then stats.path else fullPath(instance)
+		local detail = string.format("=> %s %s  dispatch=%s%s",
+			Serialiser.signature(packed),
+			describeArgs(packed),
+			Util.millis(elapsed),
+			if okCall then "" else ("  ERROR=" .. tostring(callErr))
+		)
+		emit(if okCall then "info" else "error", "net", "send.fire.routed", path, nil, detail)
+	end)
+	if not okTelemetry then
+		Engine.consoleErrors += 1
+	end
+	return okCall
+end
+
+function Network.routedInvoke(instance: any, ...: any): (boolean, any)
+	local packed = safeArgs(...)
+	local stats = Engine.remoteByInstance[instance]
+	local bucket = Engine.originals[instance]
+	local startedClock = Clock.elapsed()
+	local results = safeArgs(pcall(function(): any
+		if bucket ~= nil and bucket.InvokeServer ~= nil then
+			return (asAny(bucket.InvokeServer) :: any)(instance, table.unpack(packed, 1, packed.n))
+		end
+		return (instance :: any):InvokeServer(table.unpack(packed, 1, packed.n))
+	end))
+	local elapsed = Clock.elapsed() - startedClock
+	local okCall = results[1] == true
+	local okTelemetry = pcall(function()
+		if stats ~= nil then
+			stats.invokeCalls += 1
+			noteActivity(stats)
+			pushLatency(stats, elapsed)
+			stats.bytesEstimated += Serialiser.estimateBytes(packed)
+			if not okCall then
+				stats.errors += 1
+				stats.lastError = tostring(results[2])
+			end
+		end
+		counter("invokeCalls")
+		local path = if stats ~= nil then stats.path else fullPath(instance)
+		local detail = string.format("=> %s %s  rtt=%s%s",
+			Serialiser.signature(packed),
+			describeArgs(packed),
+			Util.millis(elapsed),
+			if okCall then "" else ("  ERROR=" .. tostring(results[2]))
+		)
+		emit(if okCall then "info" else "error", "net", "invoke.routed", path, nil, detail)
+	end)
+	if not okTelemetry then
+		Engine.consoleErrors += 1
+	end
+	return okCall, results[2]
+end
+
+--================================================================================
+-- SECTION 13 :: LAYER B :: LOCAL PLAYER ATTRIBUTE & STATE SURVEILLANCE
+--================================================================================
+
+local AttributeSurveillance = {}
+
+local PRIORITY: { [string]: boolean } = {}
+
+local function rebuildPriorityIndex(): ()
+	PRIORITY = {}
+	for _, name in ipairs(Config.attributes.priorityKeys) do
+		PRIORITY[string.lower(name)] = true
+	end
+end
+rebuildPriorityIndex()
+
+local function isPriorityKey(name: string): boolean
+	return PRIORITY[string.lower(name)] == true
+end
+
+local function attributeHost(): any
+	return playerRef()
+end
+
+local function readAttributeValue(host: any, name: string): any
+	local ok, value = pcall(function(): any
+		return (host :: any):GetAttribute(name)
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function ensureWatch(name: string): AttributeWatch
+	local existing = Engine.attributes[name]
+	if existing ~= nil then
+		return existing
+	end
+	local host = attributeHost()
+	local watch: AttributeWatch = {
+		name = name,
+		value = if host ~= nil then readAttributeValue(host, name) else nil,
+		previousValue = nil,
+		changes = 0,
+		priority = isPriorityKey(name),
+		firstSeenClock = Clock.elapsed(),
+		lastChangeClock = Clock.elapsed(),
+		lastChangeWall = Clock.wall(),
+	}
+	Engine.attributes[name] = watch
+	return watch
+end
+
+local function connectAttribute(name: string): boolean
+	if Engine.attributeConns[name] ~= nil then
+		return true
+	end
+	local host = attributeHost()
+	if host == nil then
+		emit("warn", "attr", "watch.deferred", name, "LocalPlayer is not available yet")
+		return false
+	end
+	local ok, conn = pcall(function(): any
+		return (host :: any):GetAttributeChangedSignal(name):Connect(function()
+			local okHandler, handlerErr = pcall(function()
+				local watch = ensureWatch(name)
+				local incoming = readAttributeValue(host, name)
+				watch.previousValue = watch.value
+				watch.value = incoming
+				watch.changes += 1
+				watch.lastChangeClock = Clock.elapsed()
+				watch.lastChangeWall = Clock.wall()
+				counter("attributeChanges")
+				local detail = string.format("%s -> %s  (change #%d)",
+					Serialiser.describe(watch.previousValue, 80),
+					Serialiser.describe(incoming, 80),
+					watch.changes
+				)
+				if watch.priority then
+					emit("warn", "attr", "attribute.PRIORITY", name, nil, detail)
+				else
+					emit("info", "attr", "attribute.changed", name, nil, detail)
+				end
+			end)
+			if not okHandler then
+				Engine.consoleErrors += 1
+				emit("error", "attr", "attribute.handler.error", name, tostring(handlerErr))
+			end
+		end)
+	end)
+	if ok and conn ~= nil then
+		Engine.attributeConns[name] = conn
+		return true
+	end
+	emit("warn", "attr", "watch.connect.failed", name, tostring(conn))
+	return false
+end
+
+function AttributeSurveillance.watch(name: string): boolean
+	if type(name) ~= "string" or name == "" then
+		return false
+	end
+	ensureWatch(name)
+	local connected = connectAttribute(name)
+	if connected then
+		emit("info", "attr", "watch.attached", name,
+			if isPriorityKey(name) then "PRIORITY key" else "standard key")
+	end
+	return connected
+end
+
+function AttributeSurveillance.watchAll(): number
+	local host = attributeHost()
+	if host == nil then
+		emit("warn", "attr", "watchAll.deferred", "", "LocalPlayer unavailable; will retry on poll")
+		return 0
+	end
+	local ok, attributes = pcall(function(): any
+		return (host :: any):GetAttributes()
+	end)
+	if not ok or type(attributes) ~= "table" then
+		emit("warn", "attr", "watchAll.failed", "", tostring(attributes))
+		return 0
+	end
+	local count = 0
+	local names: { string } = {}
+	for name in pairs(attributes :: { [string]: any }) do
+		if type(name) == "string" then
+			names[#names + 1] = name
+		end
+	end
+	table.sort(names, function(a: string, b: string): boolean
+		return a < b
+	end)
+	for _, name in ipairs(names) do
+		if AttributeSurveillance.watch(name) then
+			count += 1
+		end
+	end
+	emit("info", "attr", "watchAll.complete", "", string.format("%d attribute(s) under surveillance", count))
+	return count
+end
+
+function AttributeSurveillance.unwatch(name: string): boolean
+	local conn = Engine.attributeConns[name]
+	if conn == nil then
+		return false
+	end
+	pcall(function()
+		(conn :: any):Disconnect()
+	end)
+	Engine.attributeConns[name] = nil
+	emit("info", "attr", "watch.detached", name, "listener disconnected")
+	return true
+end
+
+--- Poll fallback. Covers attributes created after boot (which have no listener)
+--- and players who arrive after the engine booted.
+function AttributeSurveillance.poll(): number
+	local host = attributeHost()
+	if host == nil then
+		return 0
+	end
+	local ok, attributes = pcall(function(): any
+		return (host :: any):GetAttributes()
+	end)
+	if not ok or type(attributes) ~= "table" then
+		return 0
+	end
+	local discovered = 0
+	for name, value in pairs(attributes :: { [string]: any }) do
+		if type(name) == "string" then
+			local watch = Engine.attributes[name]
+			if watch == nil then
+				ensureWatch(name)
+				if connectAttribute(name) then
+					discovered += 1
+					emit("info", "attr", "attribute.discovered", name,
+						"new attribute observed after boot: " .. Serialiser.describe(value, 80))
+				end
+			elseif watch.value ~= value and Engine.attributeConns[name] == nil then
+				watch.previousValue = watch.value
+				watch.value = value
+				watch.changes += 1
+				watch.lastChangeClock = Clock.elapsed()
+				watch.lastChangeWall = Clock.wall()
+				counter("attributeChanges")
+				emit("info", "attr", "attribute.polled", name, nil,
+					string.format("%s -> %s (poll)",
+						Serialiser.describe(watch.previousValue, 60),
+						Serialiser.describe(value, 60)))
+			end
+		end
+	end
+	return discovered
+end
+
+function AttributeSurveillance.list(): { AttributeWatch }
+	local out: { AttributeWatch } = {}
+	for _, watch in pairs(Engine.attributes) do
+		out[#out + 1] = {
+			name = watch.name,
+			value = watch.value,
+			previousValue = watch.previousValue,
+			changes = watch.changes,
+			priority = watch.priority,
+			firstSeenClock = watch.firstSeenClock,
+			lastChangeClock = watch.lastChangeClock,
+			lastChangeWall = watch.lastChangeWall,
+		}
+	end
+	table.sort(out, function(a: AttributeWatch, b: AttributeWatch): boolean
+		if a.priority ~= b.priority then
+			return a.priority
+		end
+		return a.name < b.name
+	end)
+	return out
+end
+
+function AttributeSurveillance.get(name: string): any
+	local watch = Engine.attributes[name]
+	if watch ~= nil then
+		return watch.value
+	end
+	local host = attributeHost()
+	if host == nil then
+		return nil
+	end
+	return readAttributeValue(host, name)
+end
+
+--================================================================================
+-- SECTION 14 :: LAYER C :: SESSION & ROUTE TELEMETRY
+--================================================================================
+
+local SessionMonitor = {}
+
+local function probeNumber(owner: any, property: string): number?
+	if owner == nil then
+		return nil
+	end
+	local ok, value = pcall(function(): any
+		return (owner :: any)[property]
+	end)
+	if ok and type(value) == "number" then
+		return value
+	end
+	return nil
+end
+
+local function probeString(owner: any, property: string): string?
+	if owner == nil then
+		return nil
+	end
+	local ok, value = pcall(function(): any
+		return (owner :: any)[property]
+	end)
+	if ok and type(value) == "string" then
+		return value
+	end
+	return nil
+end
+
+local function probeBoolean(owner: any, property: string): boolean?
+	if owner == nil then
+		return nil
+	end
+	local ok, value = pcall(function(): any
+		return (owner :: any)[property]
+	end)
+	if ok and type(value) == "boolean" then
+		return value
+	end
+	return nil
+end
+
+function SessionMonitor.readRoute(): RouteSnapshot
+	local player = playerRef()
+	local route: RouteSnapshot = {
+		placeId = probeNumber(gameRef, "PlaceId"),
+		gameId = probeNumber(gameRef, "GameId"),
+		jobId = probeString(gameRef, "JobId"),
+		placeVersion = probeNumber(gameRef, "PlaceVersion"),
+		isStudio = nil,
+		serverTime = nil,
+		distributedTime = nil,
+		privateServerId = probeString(gameRef, "PrivateServerId"),
+		loaded = probeBoolean(gameRef, "Loaded"),
+		sessionClock = Clock.elapsed(),
+		userId = probeNumber(player, "UserId"),
+	}
+
+	if Services.RunService ~= nil then
+		local okStudio, isStudio = pcall(function(): any
+			return (Services.RunService :: any):IsStudio()
+		end)
+		if okStudio and type(isStudio) == "boolean" then
+			route.isStudio = isStudio
+		end
+	end
+
+	if workspaceRef ~= nil then
+		local okTime, serverTime = pcall(function(): any
+			return (workspaceRef :: any):GetServerTimeNow()
+		end)
+		if okTime and type(serverTime) == "number" then
+			route.serverTime = serverTime
+		end
+		local okDist, distributed = pcall(function(): any
+			return (workspaceRef :: any):DistributedGameTime()
+		end)
+		if okDist and type(distributed) == "number" then
+			route.distributedTime = distributed
+		end
+	end
+
+	return route
+end
+
+local function formatRoute(route: RouteSnapshot): string
+	return string.format(
+		"place=%s game=%s version=%s job=%s studio=%s privateServer=%s serverTime=%s",
+		tostring(route.placeId),
+		tostring(route.gameId),
+		tostring(route.placeVersion),
+		tostring(route.jobId),
+		tostring(route.isStudio),
+		tostring(route.privateServerId),
+		tostring(route.serverTime)
+	)
+end
+
+function SessionMonitor.recordSession(kind: string, detail: string): ()
+	Engine.sessions[#Engine.sessions + 1] = {
+		clock = Clock.elapsed(),
+		kind = kind,
+		detail = detail,
+	}
+	if #Engine.sessions > 128 then
+		table.remove(Engine.sessions, 1)
+	end
+end
+
+function SessionMonitor.recordTeleport(kind: string, info: any): ()
+	local record: TeleportRecord = {
+		clock = Clock.elapsed(),
+		wall = Clock.wall(),
+		kind = kind,
+		placeId = nil,
+		resultCode = nil,
+		message = nil,
+		ok = true,
+	}
+	if type(info) == "table" then
+		if type(info.placeId) == "number" then
+			record.placeId = info.placeId
+		end
+		if type(info.resultCode) == "number" then
+			record.resultCode = info.resultCode
+		end
+		if type(info.message) == "string" then
+			record.message = Util.stripControl(info.message)
+		end
+		if type(info.ok) == "boolean" then
+			record.ok = info.ok
+		end
+	end
+	Engine.teleports[#Engine.teleports + 1] = record
+	if #Engine.teleports > 64 then
+		table.remove(Engine.teleports, 1)
+	end
+	counter("routeEvents")
+	emit(if record.ok then "info" else "warn", "route", "teleport." .. kind, tostring(record.placeId),
+		string.format("placeId=%s result=%s message=%s",
+			tostring(record.placeId),
+			tostring(record.resultCode),
+			tostring(record.message)))
+end
+
+local function attachConnection(okFlag: boolean, conn: any, label: string, container: { any }): ()
+	if okFlag and conn ~= nil then
+		container[#container + 1] = conn
+	else
+		emit("debug", "sys", "hook.unavailable", label, "signal not connectable on this client")
+	end
+end
+
+function SessionMonitor.install(): ()
+	Engine.route = SessionMonitor.readRoute()
+	emit("info", "route", "route.snapshot", "", formatRoute(Engine.route))
+	SessionMonitor.recordSession("boot", formatRoute(Engine.route))
+
+	-- game.Loaded : fires when the DataModel finishes loading on the client
+	if gameRef ~= nil then
+		local okConn, conn = pcall(function(): any
+			return (gameRef :: any).Loaded:Connect(function()
+				Engine.route = SessionMonitor.readRoute()
+				emit("info", "route", "game.loaded", "", formatRoute(Engine.route))
+				SessionMonitor.recordSession("loaded", formatRoute(Engine.route))
+			end)
+		end)
+		attachConnection(okConn, conn, "game.Loaded", Engine.connections)
+	end
+
+	-- LocalPlayer availability (the client may boot before the player exists)
+	if Services.Players ~= nil then
+		local okConn, conn = pcall(function(): any
+			return (Services.Players :: any).PlayerAdded:Connect(function(player: any)
+				local okCompare, isLocal = pcall(function(): boolean
+					return player == (Services.Players :: any).LocalPlayer
+				end)
+				if okCompare and isLocal then
+					emit("info", "sys", "player.arrived", fullPath(player), "LocalPlayer is now available")
+					SessionMonitor.recordSession("player", fullPath(player))
+					if Config.attributes.enabled and Config.attributes.watchAll then
+						pcall(AttributeSurveillance.watchAll)
+					end
+				end
+			end)
+		end)
+		attachConnection(okConn, conn, "Players.PlayerAdded", Engine.connections)
+	end
+
+	-- Character lifecycle
+	if Config.session.watchCharacter then
+		local player = playerRef()
+		if player ~= nil then
+			local okConn, conn = pcall(function(): any
+				return (player :: any).CharacterAdded:Connect(function(character: any)
+					emit("info", "sys", "character.added", fullPath(character), "local character spawned")
+					SessionMonitor.recordSession("character.added", fullPath(character))
+				end)
+			end)
+			attachConnection(okConn, conn, "Player.CharacterAdded", Engine.connections)
+			local okConn2, conn2 = pcall(function(): any
+				return (player :: any).CharacterRemoving:Connect(function(character: any)
+					emit("info", "sys", "character.removing", fullPath(character), "local character despawned")
+					SessionMonitor.recordSession("character.removing", fullPath(character))
+				end)
+			end)
+			attachConnection(okConn2, conn2, "Player.CharacterRemoving", Engine.connections)
+		else
+			emit("debug", "sys", "character.watch.deferred", "", "LocalPlayer absent at boot")
+		end
+	end
+
+	-- TeleportService routing
+	if Config.session.watchTeleports and Services.TeleportService ~= nil then
+		local service = Services.TeleportService
+		local okFail, failConn = pcall(function(): any
+			return (service :: any).TeleportInitFailed:Connect(function(_player: any, result: any, message: any, placeId: any)
+				local code: number? = nil
+				local okCode, value = pcall(function(): any
+					return (result :: any).Value
+				end)
+				if okCode and type(value) == "number" then
+					code = value
+				end
+				SessionMonitor.recordTeleport("failed", {
+					ok = false,
+					placeId = if type(placeId) == "number" then placeId else nil,
+					resultCode = code,
+					message = if type(message) == "string" then message else nil,
+				})
+			end)
+		end)
+		attachConnection(okFail, failConn, "TeleportInitFailed", Engine.connections)
+
+		local okArrive, arriveConn = pcall(function(): any
+			return (service :: any).LocalPlayerArrivedFromTeleport:Connect(function()
+				Engine.route = SessionMonitor.readRoute()
+				emit("info", "route", "teleport.arrived", "", formatRoute(Engine.route))
+				SessionMonitor.recordSession("teleport.arrived", formatRoute(Engine.route))
+			end)
+		end)
+		attachConnection(okArrive, arriveConn, "LocalPlayerArrivedFromTeleport", Engine.connections)
+	end
+end
+
+--================================================================================
+-- SECTION 15 :: LAYER D :: BOOT / SHUTDOWN ORCHESTRATION
+--================================================================================
+
+local Boot = {}
+
+local BANNER_ART: string = table.concat({
+	"+------------------------------------------------------------------------------+",
+	"|                                                                              |",
+	"|    ####   ####      ###     ####   ###    ###   ####   #####  ###   #####    |",
+	"|    #   #  #         #   #   #      #   #  #   # #         #   #      #       |",
+	"|    #   #  ###       #####   #  ##  #   #  #   #  ###      #   #      ###     |",
+	"|    #   #  #         #   #   #   #  #   #  #   #     #     #   #      #       |",
+	"|    ####   ####      #   #    ###   ####    ###  ####      #    ###   #####   |",
+	"|                                                                              |",
+	"|                 C  O  R  E   ::   client instrumentation                     |",
+	"+------------------------------------------------------------------------------+",
+}, "\n")
+
+function Boot.banner(): string
+	local route = SessionMonitor.readRoute()
+	local lines: { string } = {
+		BANNER_ART,
+		"  DIAGNOSTICS CORE v" .. VERSION .. "  ::  " .. BUILD_TAG,
+		"  classification: AUTHORIZED INTERNAL QA / NETWORK DIAGNOSTICS",
+		string.rep("-", 78),
+		string.format("  session      : %s", Engine.session),
+		string.format("  place        : %s", tostring(route.placeId)),
+		string.format("  job          : %s", tostring(route.jobId)),
+		string.format("  studio       : %s", tostring(route.isStudio)),
+		string.format("  console      : VERBOSE (rate limit %d/s, preview %d chars)",
+			Config.console.rateLimitPerSecond, Config.console.payloadPreviewChars),
+		string.format("  ansi colour  : %s", if Config.console.ansi then "ON (terminal capture)" else "OFF (Studio-safe channel colour)"),
+		string.format("  redaction    : %s", if Config.redact.enabled then "ON" else "OFF"),
+		string.format("  ring buffer  : %d records, hash-chained", Config.ringCapacity),
+		string.rep("-", 78),
+		"  LAYER A : network interceptor   ............ starting",
+		"  LAYER B : attribute surveillance ........... starting",
+		"  LAYER C : session & route telemetry ........ starting",
+		"  LAYER D : self-contained execution ......... READY",
+		string.rep("=", 78),
+		"  ACTIVE CONSOLE LOGGING COMMENCED -- all telemetry is live.",
+		string.rep("=", 78),
+	}
+	return table.concat(lines, "\n")
+end
+
+local function applyOverrides(overrides: { [string]: any }?): ()
+	if overrides == nil then
+		return
+	end
+	local ok, err = pcall(function()
+		local function merge(target: any, source: any): ()
+			for key, value in pairs(source) do
+				if type(value) == "table" and type(target[key]) == "table" then
+					merge(target[key], value)
+				else
+					target[key] = value
+				end
+			end
+		end
+		merge(Config :: any, overrides :: any)
+		Config.ringCapacity = math.max(64, math.floor(tonumber(Config.ringCapacity) or 2048))
+		Config.console.rateLimitPerSecond = math.max(1, math.floor(tonumber(Config.console.rateLimitPerSecond) or 120))
+		Config.console.payloadPreviewChars = math.max(40, math.floor(tonumber(Config.console.payloadPreviewChars) or 220))
+		Config.limits.maxDepth = math.max(1, math.floor(tonumber(Config.limits.maxDepth) or 6))
+		Config.limits.maxKeys = math.max(1, math.floor(tonumber(Config.limits.maxKeys) or 32))
+		rebuildPriorityIndex()
+	end)
+	if not ok then
+		emit("warn", "sys", "config.rejected", "", tostring(err))
+	end
+end
+
+function Boot.start(overrides: { [string]: any }?): boolean
+	if Engine.running then
+		return true
+	end
+	if Engine.booting then
+		return false
+	end
+	Engine.booting = true
+
+	applyOverrides(overrides)
+
+	Engine.startedClock = Clock.elapsed()
+	Engine.metrics.bootAt = Engine.startedClock
+	Engine.ring = AuditRing.new(Config.ringCapacity)
+
+	local entropy = string.format("%.6f|%d|%s", Engine.startedClock, Clock.wall(), BUILD_TAG)
+	Engine.session = Util.hex32(Util.fnv1a(entropy))
+		.. Util.hex32(Util.fnv1a(entropy .. "|" .. VERSION .. "|" .. tostring(#Engine.scanConns)))
+
+	Engine.running = true
+
+	local okBanner = pcall(function()
+		print(Boot.banner())
+	end)
+	if not okBanner then
+		Engine.consoleErrors += 1
+	end
+
+	local degraded: { string } = {}
+
+	local function staged(name: string, fn: () -> ())
+		local ok, err = pcall(fn)
+		if not ok then
+			degraded[#degraded + 1] = name
+			emit("error", "sys", "stage.failed", name, tostring(err))
+		end
+	end
+
+	staged("session", SessionMonitor.install)
+
+	staged("scan", function()
+		if not Config.scan.enabled then
+			emit("info", "net", "scan.disabled", "", "network scan disabled by configuration")
+			return
+		end
+		Network.scan()
+		Network.watchRoots()
+	end)
+
+	staged("attributes", function()
+		if not Config.attributes.enabled then
+			emit("info", "attr", "surveillance.disabled", "", "attribute surveillance disabled by configuration")
+			return
+		end
+		if Config.attributes.watchAll then
+			AttributeSurveillance.watchAll()
+		end
+		if Config.attributes.pollInterval > 0 and taskLib ~= nil then
+			Engine.attributePollThread = taskLib.spawn(function()
+				while Engine.running do
+					taskLib.wait(Config.attributes.pollInterval)
+					pcall(AttributeSurveillance.poll)
+				end
+			end)
+		end
+	end)
+
+	Engine.booting = false
+	Engine.metrics.bootAt = Clock.elapsed()
+
+	Console.rule(string.format("DIAGNOSTICS CORE v%s ONLINE  session=%s  degraded=%d", VERSION, Engine.session, #degraded))
+	emit("info", "sys", "engine.online", "", string.format(
+		"remotes=%d wraps=%d attributes=%d boot=%s",
+		#Network.listRemotes(),
+		Engine.metrics.remoteWraps,
+		#AttributeSurveillance.list(),
+		Util.millis(Clock.elapsed() - Engine.startedClock)
+	))
+	return true
+end
+
+function Boot.stop(): boolean
+	if not Engine.running then
+		return true
+	end
+	local ok = pcall(function()
+		Engine.running = false
+
+		if Engine.attributePollThread ~= nil and taskLib ~= nil then
+			pcall(taskLib.cancel, Engine.attributePollThread)
+			Engine.attributePollThread = nil
+		end
+
+		for _, conn in ipairs(Engine.connections) do
+			pcall(function()
+				(conn :: any):Disconnect()
+			end)
+		end
+		Engine.connections = {}
+
+		for _, conn in ipairs(Engine.scanConns) do
+			pcall(function()
+				(conn :: any):Disconnect()
+			end)
+		end
+		Engine.scanConns = {}
+
+		for name, conn in pairs(Engine.attributeConns) do
+			pcall(function()
+				(conn :: any):Disconnect()
+			end)
+			Engine.attributeConns[name] = nil
+		end
+
+		local tracked: { any } = {}
+		for instance in pairs(Engine.remoteByInstance) do
+			tracked[#tracked + 1] = instance
+		end
+		for _, instance in ipairs(tracked) do
+			Network.untrack(instance)
+		end
+
+		emit("info", "sys", "engine.offline", "", string.format(
+			"records=%d dropped=%d errors=%d uptime=%s",
+			AuditRing.total(Engine.ring),
+			AuditRing.dropped(Engine.ring),
+			Engine.errors,
+			Util.millis(Clock.elapsed() - Engine.startedClock)
+		))
+		Console.rule("DIAGNOSTICS CORE OFFLINE -- hooks restored, listeners disconnected")
+	end)
+	if not ok then
+		Engine.consoleErrors += 1
+		return false
+	end
+	return true
+end
+
+--================================================================================
+-- SECTION 16 :: PUBLIC API IMPLEMENTATION
+--================================================================================
+
+function Network.listRemotes(): { RemoteStats }
+	local out: { RemoteStats } = {}
+	for _, stats in pairs(Engine.remotes) do
+		out[#out + 1] = stats
+	end
+	table.sort(out, function(a: RemoteStats, b: RemoteStats): boolean
+		return a.path < b.path
+	end)
+	return out
+end
+
+local API: DiagnosticAPI
+
+local function verifyChain(): (boolean, string?)
+	local previous = AuditRing.anchor(Engine.ring)
+	local size = AuditRing.size(Engine.ring)
+	for index = 1, size do
+		local record = AuditRing.get(Engine.ring, index)
+		if record == nil then
+			return false, string.format("gap at retained index %d", index)
+		end
+		if record.prevHash ~= previous then
+			return false, string.format("chain break at seq %d (prev mismatch)", record.seq)
+		end
+		local expected = Util.fnv1a(
+			tostring(record.seq) .. "|" .. tostring(record.clock) .. "|" .. record.event .. "|" .. record.body,
+			record.prevHash
+		)
+		if record.hash ~= expected then
+			return false, string.format("hash mismatch at seq %d", record.seq)
+		end
+		previous = record.hash
+	end
+	return true, nil
+end
+
+local function toAuditRow(record: StoredRecord): AuditRow
+	return {
+		seq = record.seq,
+		clock = record.clock,
+		wall = record.wall,
+		channel = record.channel,
+		level = record.level,
+		event = record.event,
+		tag = record.tag,
+		hash = record.hash,
+		prevHash = record.prevHash,
+		size = record.size,
+		preview = Util.truncate(record.body, 240),
+	}
+end
+
+local function aggregateLatency(): { [string]: number }
+	local samples: { number } = {}
+	for _, stats in pairs(Engine.remotes) do
+		for _, value in ipairs(stats.latencySamples) do
+			samples[#samples + 1] = value
+		end
+	end
+	local worst = 0
+	for _, value in ipairs(samples) do
+		if value > worst then
+			worst = value
+		end
+	end
+	return {
+		samples = #samples,
+		p50 = Util.percentile(samples, 0.50),
+		p95 = Util.percentile(samples, 0.95),
+		p99 = Util.percentile(samples, 0.99),
+		max = worst,
+	}
+end
+
+API = {
+	Boot = function(overrides: { [string]: any }?): boolean
+		local ok, result = pcall(Boot.start, overrides)
+		if not ok then
+			Engine.consoleErrors += 1
+			pcall(function()
+				print("[DCORE] boot failure: " .. tostring(result))
+			end)
+			return false
+		end
+		return result == true
+	end,
+
+	Shutdown = function(): boolean
+		local ok, result = pcall(Boot.stop)
+		if not ok then
+			Engine.consoleErrors += 1
+			return false
+		end
+		return result == true
+	end,
+
+	IsRunning = function(): boolean
+		return Engine.running
+	end,
+
+	Config = function(): EngineConfig
+		return (Util.deepCopy(Config) :: any) :: EngineConfig
+	end,
+
+	Configure = function(overrides: { [string]: any }): boolean
+		applyOverrides(overrides)
+		emit("info", "sys", "config.updated", "", Serialiser.describe(overrides, 160))
+		return true
+	end,
+
+	Scan = function(): number
+		local ok, result = pcall(Network.scan)
+		if not ok then
+			emit("error", "net", "scan.error", "", tostring(result))
+			return 0
+		end
+		return result
+	end,
+
+	TrackRemote = function(instance: InstanceRef): boolean
+		local ok, result = pcall(Network.track, instance)
+		if not ok then
+			emit("error", "net", "track.error", "", tostring(result))
+			return false
+		end
+		return result == true
+	end,
+
+	UntrackRemote = function(instance: InstanceRef): boolean
+		local ok, result = pcall(Network.untrack, instance)
+		if not ok then
+			emit("error", "net", "untrack.error", "", tostring(result))
+			return false
+		end
+		return result == true
+	end,
+
+	RoutedFire = function(instance: InstanceRef, ...: any): boolean
+		local packed = safeArgs(...)
+		local ok, result = pcall(Network.routedFire, instance, table.unpack(packed, 1, packed.n))
+		if not ok then
+			emit("error", "net", "routedFire.error", "", tostring(result))
+			return false
+		end
+		return result == true
+	end,
+
+	RoutedInvoke = function(instance: InstanceRef, ...: any): (boolean, any)
+		local packed = safeArgs(...)
+		local ok, first, second = pcall(Network.routedInvoke, instance, table.unpack(packed, 1, packed.n))
+		if not ok then
+			emit("error", "net", "routedInvoke.error", "", tostring(first))
+			return false, first
+		end
+		return first == true, second
+	end,
+
+	Remotes = function(): { RemoteStats }
+		return Network.listRemotes()
+	end,
+
+	WatchAttribute = function(name: string): boolean
+		local ok, result = pcall(AttributeSurveillance.watch, name)
+		if not ok then
+			emit("error", "attr", "watch.error", tostring(name), tostring(result))
+			return false
+		end
+		return result == true
+	end,
+
+	UnwatchAttribute = function(name: string): boolean
+		local ok, result = pcall(AttributeSurveillance.unwatch, name)
+		if not ok then
+			return false
+		end
+		return result == true
+	end,
+
+	WatchAllAttributes = function(): number
+		local ok, result = pcall(AttributeSurveillance.watchAll)
+		if not ok then
+			emit("error", "attr", "watchAll.error", "", tostring(result))
+			return 0
+		end
+		return result
+	end,
+
+	Attributes = function(): { AttributeWatch }
+		local ok, result = pcall(AttributeSurveillance.list)
+		if not ok then
+			return {}
+		end
+		return result
+	end,
+
+	GetAttribute = function(name: string): any
+		local ok, result = pcall(AttributeSurveillance.get, name)
+		if not ok then
+			return nil
+		end
+		return result
+	end,
+
+	Route = function(): RouteSnapshot
+		local ok, result = pcall(SessionMonitor.readRoute)
+		if not ok then
+			return {
+				placeId = nil, gameId = nil, jobId = nil, placeVersion = nil,
+				isStudio = nil, serverTime = nil, distributedTime = nil,
+				privateServerId = nil, loaded = nil,
+				sessionClock = Clock.elapsed(), userId = nil,
+			}
+		end
+		return result
+	end,
+
+	Teleports = function(): { TeleportRecord }
+		local out: { TeleportRecord } = {}
+		for index, record in ipairs(Engine.teleports) do
+			out[index] = record
+		end
+		return out
+	end,
+
+	Sessions = function(): { SessionEvent }
+		local out: { SessionEvent } = {}
+		for index, event in ipairs(Engine.sessions) do
+			out[index] = event
+		end
+		return out
+	end,
+
+	Audit = function(limit: number?): { AuditRow }
+		local out: { AuditRow } = {}
+		local size = AuditRing.size(Engine.ring)
+		local first = if limit == nil then 1 else math.max(1, size - limit + 1)
+		for index = first, size do
+			local record = AuditRing.get(Engine.ring, index)
+			if record ~= nil then
+				out[#out + 1] = toAuditRow(record)
+			end
+		end
+		return out
+	end,
+
+	Search = function(needle: string, limit: number?): { AuditRow }
+		local out: { AuditRow } = {}
+		local lowered = string.lower(needle)
+		local size = AuditRing.size(Engine.ring)
+		local cap = limit or math.huge
+		for index = 1, size do
+			local record = AuditRing.get(Engine.ring, index)
+			if record ~= nil then
+				local haystack = string.lower(record.channel .. "|" .. record.event .. "|" .. record.tag .. "|" .. record.body)
+				if string.find(haystack, lowered, 1, true) ~= nil then
+					out[#out + 1] = toAuditRow(record)
+					if #out >= cap then
+						break
+					end
+				end
+			end
+		end
+		return out
+	end,
+
+	Verify = function(): (boolean, string?)
+		local ok, first, second = pcall(verifyChain)
+		if not ok then
+			return false, tostring(first)
+		end
+		return first == true, second
+	end,
+
+	Metrics = function(): { [string]: any }
+		local latency = aggregateLatency()
+		local attributeCount = 0
+		for _ in pairs(Engine.attributes) do
+			attributeCount += 1
+		end
+		return {
+			version = VERSION,
+			session = Engine.session,
+			running = Engine.running,
+			uptime = Clock.elapsed() - Engine.startedClock,
+			records = AuditRing.total(Engine.ring),
+			buffered = AuditRing.size(Engine.ring),
+			dropped = AuditRing.dropped(Engine.ring),
+			errors = Engine.errors,
+			consoleErrors = Engine.consoleErrors,
+			remotes = #Network.listRemotes(),
+			attributes = attributeCount,
+			teleports = #Engine.teleports,
+			latency = latency,
+			counters = table.clone(Engine.metrics),
+			integrity = (select(1, verifyChain())),
+		}
+	end,
+
+	Report = function(): string
+		local metrics = API.Metrics()
+		local route = SessionMonitor.readRoute()
+		local latency = metrics.latency :: { [string]: number }
+		local lines: { string } = {
+			string.rep("=", 78),
+			string.format("DIAGNOSTICS CORE REPORT  v%s  session=%s", VERSION, Engine.session),
+			string.rep("=", 78),
+			string.format("  status          : %s   uptime %s",
+				if Engine.running then "RUNNING" else "STOPPED",
+				Util.millis(metrics.uptime :: number)),
+			string.format("  route           : place=%s job=%s studio=%s",
+				tostring(route.placeId), tostring(route.jobId), tostring(route.isStudio)),
+			string.format("  records         : %s total, %d buffered, %d evicted",
+				Util.commas(metrics.records :: number), metrics.buffered :: number, metrics.dropped :: number),
+			string.format("  integrity       : %s", if metrics.integrity then "VERIFIED" else "BREAK DETECTED"),
+			string.format("  errors          : %d engine, %d containment", metrics.errors :: number, metrics.consoleErrors :: number),
+			string.rep("-", 78),
+			string.format("  remotes tracked : %d", metrics.remotes :: number),
+			string.format("  fire calls      : %s", Util.commas(Engine.metrics.fireCalls)),
+			string.format("  invoke calls    : %s", Util.commas(Engine.metrics.invokeCalls)),
+			string.format("  inbound events  : %s", Util.commas(Engine.metrics.inboundEvents)),
+			string.format("  wraps applied   : %d (%d denied)", Engine.metrics.remoteWraps, Engine.metrics.remoteWrapDenials),
+			string.format("  latency p50/p95 : %s / %s (%d samples)",
+				Util.millis(latency.p50), Util.millis(latency.p95), latency.samples),
+			string.rep("-", 78),
+			string.format("  attributes      : %d tracked, %s changes",
+				metrics.attributes :: number, Util.commas(Engine.metrics.attributeChanges)),
+		}
+		for _, watch in ipairs(AttributeSurveillance.list()) do
+			lines[#lines + 1] = string.format("    %-24s = %-28s (changes=%d%s)",
+				watch.name,
+				Util.truncate(Serialiser.describe(watch.value, 40), 28),
+				watch.changes,
+				if watch.priority then ", PRIORITY" else "")
+		end
+		lines[#lines + 1] = string.rep("-", 78)
+		lines[#lines + 1] = string.format("  teleports       : %d captured", metrics.teleports :: number)
+		for _, record in ipairs(Engine.teleports) do
+			lines[#lines + 1] = string.format("    [%s] %s place=%s result=%s %s",
+				Util.millis(record.clock), record.kind,
+				tostring(record.placeId), tostring(record.resultCode), tostring(record.message))
+		end
+		lines[#lines + 1] = string.rep("=", 78)
+		return table.concat(lines, "\n")
+	end,
+
+	Dump = function(value: any): string
+		local ok, text = pcall(function(): string
+			return Serialiser.describe(value, 4096)
+		end)
+		if ok and type(text) == "string" then
+			return text
+		end
+		return "<dump failed: " .. Serialiser.typeOf(value) .. ">"
+	end,
+
+	Banner = function(): string
+		return Boot.banner()
+	end,
+
+	Clear = function(): boolean
+		local ok = pcall(function()
+			AuditRing.clear(Engine.ring)
+			Engine.seq = 0
+			emit("info", "sys", "buffer.cleared", "", "audit ring reset; chain restarted from anchor")
+		end)
+		return ok
+	end,
+
+	Console = {
+		SetANSI = function(enabled: boolean): ()
+			Console.SetANSI(enabled)
+			emit("info", "sys", "console.ansi", "", if enabled then "ANSI palette enabled" else "ANSI palette disabled")
+		end,
+		SetRateLimit = function(perSecond: number): ()
+			Console.SetRateLimit(perSecond)
+			emit("info", "sys", "console.ratelimit", "", string.format("%d lines/second", Config.console.rateLimitPerSecond))
+		end,
+		Rule = function(title: string): ()
+			Console.rule(title)
+		end,
+	},
+}
+
+--================================================================================
+-- SECTION 17 :: LAYER D :: SELF-CONTAINED EXECUTION BLOCK
+--================================================================================
+
+--- Protective boot. Every failure mode here is contained: the module always
+--- returns a usable API table, even when the environment refuses every hook.
+local bootOk, bootErr = pcall(function()
+	if not Config.autoBoot then
+		return
+	end
+	Boot.start(nil)
+end)
+
+if not bootOk then
+	Engine.consoleErrors += 1
+	pcall(function()
+		print("[DCORE] boot contained failure: " .. tostring(bootErr))
+	end)
+end
+
+return API
