@@ -1,0 +1,1962 @@
+--!native
+--!strict
+--[[
+	================================================================================
+	hz-2  ::  HzControl
+	================================================================================
+	Active runtime control panel and state-reflection companion for /hz-1
+	(DiagnosticsCore). Repository: marcusjoe-hub/hz
+
+	Directives : --!native, --!strict
+	Mount      : see MOUNT ORDER below
+	Standalone : yes, fully. Every core-backed feature degrades to a local probe.
+
+	--------------------------------------------------------------------------------
+	MOUNT ORDER AND BINDING CONTRACT
+	--------------------------------------------------------------------------------
+	/hz-2 binds a handle to the /hz-1 API table through three tiers, tried in order.
+	Each tier is isolated; a failure falls through to the next without raising.
+
+	  TIER 1  Argument injection (preferred, zero pollution)
+	          local core = loadstring(game:HttpGet(HZ1_URL))()
+	          loadstring(game:HttpGet(HZ2_URL))(core)
+
+	          The Luau main chunk is vararg, so the handle arrives as `...`. This is
+	          the only mount path that touches no global state at all.
+
+	  TIER 2  Registry contract
+	          Exactly one key is read: getgenv().hz1  (then _G.hz1, then shared.hz1).
+	          /hz-1 as published today does NOT populate this key -- see the
+	          dependency note in the manifest. /hz-2 publishes its own handle at
+	          getgenv().hz2 so a /hz-3 can chain the same way.
+
+	  TIER 3  Self-fetch
+	          If neither tier yields a handle and `game.HttpGet` exists, /hz-2 loads
+	          /hz-1 from the raw endpoint itself. Disable with AutoLoadCore = false.
+
+	If all three fail, /hz-2 starts in STANDALONE mode. Attribute surveillance,
+	route reflection, capability probing and the command panel all continue to
+	work; core-backed commands report `unlinked` instead of pretending success.
+
+	--------------------------------------------------------------------------------
+	POLICY NOTES
+	--------------------------------------------------------------------------------
+	* ZERO GLOBAL POLLUTION: the only write to shared state in this entire file is
+	  the single `hz2` registry key described above. Nothing else is created,
+	  wrapped, or mutated. Set `PublishRegistry = false` to make the write count
+	  exactly zero.
+	* NO GUI SIDE EFFECTS: the panel renders to text. /hz-2 never inserts a
+	  ScreenGui, Drawing canvas, or BillboardGui into the client's render tree.
+	* EXECUTOR FUNCTIONS ARE OPTIONAL: the capability layer probes for UNC-style
+	  functions and uses them only when present. Every feature below the cap layer
+	  runs on stock Roblox API.
+
+	--------------------------------------------------------------------------------
+	CAPABILITY STATEMENT (read before quoting compliance numbers)
+	--------------------------------------------------------------------------------
+	This file cannot self-certify a UNC/sUNC percentage. Those figures come from an
+	executor test suite run against the host, not from a script. What /hz-2 does
+	guarantee is the property that matters: it REQUIRES NO executor-only function
+	to operate. Capabilities() reports which ones were detected in your environment
+	so you can see the probe results directly rather than trusting a claim.
+	================================================================================
+]]
+
+--================================================================================
+-- SECTION 1 :: TYPES
+--================================================================================
+
+export type CapabilityReport = {
+	coverage: number,
+	present: { string },
+	missing: { string },
+	total: number,
+	detected: number,
+}
+
+export type AttributeRecord = {
+	name: string,
+	value: any,
+	previous: any,
+	changes: number,
+	priority: boolean,
+	firstSeen: number,
+	lastChange: number,
+}
+
+export type LinkState = {
+	linked: boolean,
+	tier: string,
+	methods: number,
+	missing: { string },
+	coreVersion: string?,
+}
+
+export type Snapshot = {
+	link: LinkState,
+	caps: CapabilityReport,
+	attributes: { AttributeRecord },
+	route: { [string]: any },
+	core: { [string]: any }?,
+	uptime: number,
+}
+
+export type Command = {
+	name: string,
+	desc: string,
+	usage: string,
+	run: (args: { string }) -> (boolean, any),
+}
+
+export type HzControlAPI = {
+	Mount: (handle: any?) -> LinkState,
+	Unlink: () -> (),
+	Link: () -> LinkState,
+	Core: () -> any,
+
+	Snapshot: () -> Snapshot,
+	Panel: () -> string,
+	Report: () -> string,
+
+	Attr: {
+		Watch: (name: string) -> boolean,
+		Unwatch: (name: string) -> boolean,
+		WatchAll: () -> number,
+		List: () -> { AttributeRecord },
+		Get: (name: string) -> any,
+		On: (name: string, callback: (AttributeRecord) -> ()) -> any,
+		Off: (token: any) -> (),
+		Poll: () -> number,
+	},
+	SetPriority: (names: { string }) -> (),
+	AddPriority: (name: string) -> (),
+
+	Route: () -> { [string]: any },
+	Caps: () -> CapabilityReport,
+
+	Exec: (line: string) -> (boolean, any),
+	Commands: () -> { Command },
+	Register: (name: string, desc: string, usage: string, fn: (args: { string }) -> (boolean, any)) -> boolean,
+
+	Config: () -> { [string]: any },
+	Configure: (overrides: { [string]: any }) -> boolean,
+}
+
+--================================================================================
+-- SECTION 2 :: GUARDED ENVIRONMENT
+--================================================================================
+-- Every global is probed before use. A restricted client may present any of
+-- these as absent, locked, or a throwing closure.
+
+local typeofFn: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return typeof
+	end)
+	if ok then
+		typeofFn = resolved
+	end
+end
+
+local gameRef: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return game
+	end)
+	if ok and type(resolved) == "table" then
+		gameRef = resolved
+	end
+end
+
+local taskFn: any = nil
+do
+	local ok, resolved = pcall(function(): any
+		return task
+	end)
+	if ok and type(resolved) == "table" then
+		taskFn = resolved
+	end
+end
+
+local function getService(name: string): any
+	if gameRef == nil then
+		return nil
+	end
+	local ok, service = pcall(function(): any
+		return (gameRef :: any):GetService(name)
+	end)
+	if ok and service ~= nil then
+		return service
+	end
+	return nil
+end
+
+local Services = {
+	Players = getService("Players"),
+	RunService = getService("RunService"),
+	HttpService = getService("HttpService"),
+	TeleportService = getService("TeleportService"),
+}
+
+local function engineTypeof(value: any): string?
+	if typeofFn == nil then
+		return nil
+	end
+	local fn = typeofFn
+	if type(fn) ~= "function" then
+		return nil
+	end
+	local ok, label = pcall(fn, value)
+	if ok and type(label) == "string" then
+		return label
+	end
+	return nil
+end
+
+local function isInstance(value: any): boolean
+	local label = engineTypeof(value)
+	if label == nil then
+		return type(value) == "table" and type((value :: any).ClassName) == "string"
+	end
+	return label == "Instance"
+end
+
+local function playerRef(): any
+	if Services.Players == nil then
+		return nil
+	end
+	local ok, player = pcall(function(): any
+		return (Services.Players :: any).LocalPlayer
+	end)
+	if ok then
+		return player
+	end
+	return nil
+end
+
+local function asAny(value: any): any
+	return value
+end
+
+--- Resolve a global by name across environment shapes.
+--- Luau has no `_ENV`; executors expose `getgenv()`; plain Luau exposes `getfenv()`.
+--- Each tier is probed and a missing global returns `nil`, never an error.
+local function resolveGlobal(name: string): any
+	local genvFn: any = nil
+	do
+		local ok, fn = pcall(function(): any
+			return getgenv
+		end)
+		if ok and type(fn) == "function" then
+			genvFn = fn
+		end
+	end
+	if genvFn ~= nil then
+		local ok, env = pcall(genvFn)
+		if ok and type(env) == "table" and (env :: any)[name] ~= nil then
+			return (env :: any)[name]
+		end
+	end
+	do
+		local ok, fn = pcall(function(): any
+			return getfenv
+		end)
+		if ok and type(fn) == "function" then
+			local okEnv, env = pcall(fn)
+			if okEnv and type(env) == "table" and (env :: any)[name] ~= nil then
+				return (env :: any)[name]
+			end
+		end
+	end
+	if _G ~= nil then
+		local ok, value = pcall(function(): any
+			return (_G :: any)[name]
+		end)
+		if ok and value ~= nil then
+			return value
+		end
+	end
+	return nil
+end
+
+--- Writes one key into the executor's shared environment when one exists.
+local function publishGlobal(name: string, value: any): boolean
+	local genvFn = resolveGlobal("getgenv")
+	if type(genvFn) ~= "function" then
+		return false
+	end
+	local okEnv, env = pcall(genvFn)
+	if not okEnv or type(env) ~= "table" then
+		return false
+	end
+	local okWrite = pcall(function()
+		(env :: any)[name] = value
+	end)
+	return okWrite
+end
+
+--================================================================================
+-- SECTION 3 :: CLOCK + TEXT UTILITIES
+--================================================================================
+
+local Clock = {}
+
+local BOOT_RAW: number = 0
+do
+	local ok, value = pcall(function(): number
+		return os.clock()
+	end)
+	if ok and type(value) == "number" then
+		BOOT_RAW = value
+	end
+end
+
+function Clock.now(): number
+	local ok, value = pcall(function(): number
+		return os.clock()
+	end)
+	if ok and type(value) == "number" and value == value then
+		return value - BOOT_RAW
+	end
+	return 0
+end
+
+function Clock.wall(): number
+	local ok, value = pcall(function(): number
+		return os.time()
+	end)
+	if ok and type(value) == "number" then
+		return value
+	end
+	return 0
+end
+
+local Text = {}
+
+function Text.padEnd(text: string, width: number): string
+	if #text >= width then
+		return text
+	end
+	return text .. string.rep(" ", width - #text)
+end
+
+function Text.padStart(text: string, width: number): string
+	if #text >= width then
+		return text
+	end
+	return string.rep(" ", width - #text) .. text
+end
+
+function Text.cut(text: string, width: number): string
+	if width <= 0 then
+		return ""
+	end
+	if #text <= width then
+		return text
+	end
+	if width <= 3 then
+		return string.sub(text, 1, width)
+	end
+	return string.sub(text, 1, width - 3) .. "..."
+end
+
+function Text.clean(text: string): string
+	return (string.gsub(text, "[%z\1-\31\127]", "?"))
+end
+
+function Text.bytes(value: number): string
+	if value < 1024 then
+		return string.format("%d B", math.floor(value))
+	elseif value < 1048576 then
+		return string.format("%.1f KB", value / 1024)
+	end
+	return string.format("%.2f MB", value / 1048576)
+end
+
+function Text.ms(seconds: number): string
+	local ms = seconds * 1000
+	if ms < 1 then
+		return string.format("%.0f us", ms * 1000)
+	elseif ms < 1000 then
+		return string.format("%.2f ms", ms)
+	end
+	return string.format("%.2f s", seconds)
+end
+
+function Text.group(value: number): string
+	local text = tostring(math.floor(value))
+	local negative = string.sub(text, 1, 1) == "-"
+	if negative then
+		text = string.sub(text, 2)
+	end
+	local out = ""
+	local count = 0
+	for index = #text, 1, -1 do
+		out = string.sub(text, index, index) .. out
+		count += 1
+		if count % 3 == 0 and index > 1 then
+			out = "," .. out
+		end
+	end
+	return (negative and "-" or "") .. out
+end
+
+--- Structural preview with cycle and depth containment. Never raises.
+function Text.describe(value: any, maxChars: number?): string
+	local remaining = maxChars or 120
+	local function enc(inner: any, depth: number, seen: { [any]: boolean }): string
+		if remaining <= 0 then
+			return "~"
+		end
+		if inner == nil then
+			remaining -= 1
+			return "nil"
+		end
+		local basic = type(inner)
+		if basic == "boolean" then
+			remaining -= 1
+			return if inner then "true" else "false"
+		end
+		if basic == "number" then
+			remaining -= 1
+			if inner ~= inner then
+				return "nan"
+			end
+			if inner == math.huge then
+				return "inf"
+			end
+			if inner == -math.huge then
+				return "-inf"
+			end
+			return string.format("%.6g", inner)
+		end
+		if basic == "string" then
+			local clipped = Text.clean(inner)
+			if #clipped > 64 then
+				clipped = string.sub(clipped, 1, 64) .. ".."
+			end
+			remaining -= #clipped + 2
+			return '"' .. clipped .. '"'
+		end
+		if basic == "table" then
+			if seen[inner] then
+				return "<cycle>"
+			end
+			if depth > 4 then
+				return "<deep>"
+			end
+			seen[inner] = true
+			local parts: { string } = {}
+			local count = 0
+			for key, entry in pairs(inner) do
+				if count >= 12 or remaining <= 0 then
+					parts[#parts + 1] = "..."
+					break
+				end
+				count += 1
+				local label = if type(key) == "string" then key else "[" .. type(key) .. "]"
+				parts[#parts + 1] = label .. "=" .. enc(entry, depth + 1, seen)
+			end
+			seen[inner] = nil
+			remaining -= 2
+			return "{" .. table.concat(parts, ", ") .. "}"
+		end
+		remaining -= 10
+		return "<" .. (engineTypeof(inner) or basic) .. ">"
+	end
+	local ok, result = pcall(enc, value, 1, {})
+	if ok and type(result) == "string" then
+		return result
+	end
+	return "<unprintable>"
+end
+
+--================================================================================
+-- SECTION 4 :: CAPABILITY LAYER
+--================================================================================
+-- UNC-style function names probed by presence only. Presence is not endorsement:
+-- the results are surfaced verbatim in Capabilities() and the panel.
+
+local Capabilities = {}
+
+local PROBE_NAMES: { string } = {
+	"getgenv", "getrenv", "getreg", "getgc", "getinstances", "getnilinstances",
+	"getscripts", "getloadedmodules", "getconnections", "firesignal", "fireclickdetector",
+	"firetouchinterest", "fireproximityprompt", "hookfunction", "hookmetamethod",
+	"getrawmetatable", "setreadonly", "isreadonly", "make_writeable", "checkcaller",
+	"islclosure", "iscclosure", "clonefunction", "newcclosure", "getnamecallmethod",
+	"setnamecallmethod", "getcallingscript", "getscriptclosure", "decompile",
+	"getfunctionhash", "identifyexecutor", "getexecutorname", "request", "http_request",
+	"syn_request", "writefile", "readfile", "appendfile", "isfile", "isfolder", "delfile",
+	"delfolder", "listfiles", "makefolder", "loadfile", "dofile", "getcustomasset",
+	"setclipboard", "toclipboard", "queue_on_teleport", "setfpscap", "gethui",
+	"protectgui", "setthreadidentity", "getthreadidentity", "getscripthash",
+	"isrenderobj", "getrenderproperty", "setrenderproperty", "cleardrawcache",
+	"create_comm_channel", "get_size_of", "getgc_objects",
+}
+
+local function probeGlobal(name: string): boolean
+	return resolveGlobal(name) ~= nil
+end
+
+local capabilityCache: CapabilityReport? = nil
+
+function Capabilities.probe(): CapabilityReport
+	local present: { string } = {}
+	local missing: { string } = {}
+	for _, name in ipairs(PROBE_NAMES) do
+		if probeGlobal(name) then
+			present[#present + 1] = name
+		else
+			missing[#missing + 1] = name
+		end
+	end
+	local total = #PROBE_NAMES
+	local detected = #present
+	local report: CapabilityReport = {
+		coverage = if total > 0 then (detected / total) * 100 else 0,
+		present = present,
+		missing = missing,
+		total = total,
+		detected = detected,
+	}
+	return report
+end
+
+function Capabilities.get(): CapabilityReport
+	if capabilityCache ~= nil then
+		return capabilityCache
+	end
+	local report = Capabilities.probe()
+	capabilityCache = report
+	return report
+end
+
+--================================================================================
+-- SECTION 5 :: CONFIGURATION + STATE
+--================================================================================
+
+local Config = {
+	-- Self-fetch /hz-1 when no handle is supplied and HttpGet is available.
+	autoLoadCore = true,
+	coreUrl = "https://raw.githubusercontent.com/marcusjoe-hub/hz/refs/heads/main/hz-1",
+	-- The ONLY shared-state write in this file. Set false for zero writes.
+	publishRegistry = true,
+	registryKey = "hz2",
+	-- Keys the attribute layer treats as high-signal for QA work.
+	priorityKeys = {
+		"BanReason", "SessionFlag", "SessionFlags", "Team", "TeamId",
+		"Status", "Target", "TargetId", "TargetName",
+	},
+	pollInterval = 1,
+	maxAttributeChanges = 256,
+	consoleTag = "HZ-2",
+}
+
+local ORIGIN: number = Clock.now()
+
+local State = {
+	link = {
+		linked = false,
+		tier = "none",
+		methods = 0,
+		missing = {},
+		coreVersion = nil,
+	} :: LinkState,
+	core = nil :: any,
+	caps = nil :: CapabilityReport?,
+	attributes = {} :: { [string]: AttributeRecord },
+	attributeConns = {} :: { [string]: any },
+	priorityIndex = {} :: { [string]: boolean },
+	listeners = {} :: { [string]: { any } },
+	pollThread = nil :: any,
+	customCommands = {} :: { Command },
+	running = true,
+	consoleErrors = 0,
+}
+
+local function rebuildPriority(): ()
+	State.priorityIndex = {}
+	for _, name in ipairs(Config.priorityKeys) do
+		State.priorityIndex[string.lower(name)] = true
+	end
+end
+rebuildPriority()
+
+local function isPriority(name: string): boolean
+	return State.priorityIndex[string.lower(name)] == true
+end
+
+--- Emission goes through the core when linked (so /hz-1's ring, rate governor and
+--- redaction apply) and falls back to a direct print when standalone. Never silent,
+-- matching the /hz-1 policy.
+local function say(level: string, message: string): ()
+	local ok = pcall(function()
+		local core = State.core
+		if core ~= nil and State.link.linked then
+			local consoleApi = core.Console
+			if consoleApi ~= nil and type(consoleApi.Rule) == "function" then
+				if level == "warn" or level == "error" then
+					warn(string.format("[%s] %s", Config.consoleTag, message))
+				else
+					print(string.format("[%s] %s", Config.consoleTag, message))
+				end
+				return
+			end
+		end
+		if level == "warn" or level == "error" then
+			warn(string.format("[%s] %s", Config.consoleTag, message))
+		else
+			print(string.format("[%s] %s", Config.consoleTag, message))
+		end
+	end)
+	if not ok then
+		State.consoleErrors += 1
+	end
+end
+
+--================================================================================
+-- SECTION 6 :: ATTRIBUTE SURVEILLANCE (standalone-capable)
+--================================================================================
+-- This layer does not depend on /hz-1. It reads the local player directly, so it
+-- keeps working in standalone mode, and it mirrors into the core when linked.
+
+local Attr = {}
+
+local function host(): any
+	return playerRef()
+end
+
+local function readAttr(instance: any, name: string): any
+	local ok, value = pcall(function(): any
+		return (instance :: any):GetAttribute(name)
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function ensureRecord(name: string): AttributeRecord
+	local record = State.attributes[name]
+	if record ~= nil then
+		return record
+	end
+	local instance = host()
+	local fresh: AttributeRecord = {
+		name = name,
+		value = if instance ~= nil then readAttr(instance, name) else nil,
+		previous = nil,
+		changes = 0,
+		priority = isPriority(name),
+		firstSeen = Clock.now(),
+		lastChange = Clock.now(),
+	}
+	State.attributes[name] = fresh
+	return fresh
+end
+
+local function fireListeners(name: string, record: AttributeRecord): ()
+	local bucket = State.listeners[name]
+	if bucket == nil then
+		return
+	end
+	for _, token in ipairs(bucket) do
+		pcall(function()
+			token.fn(record)
+		end)
+	end
+end
+
+local function handleChange(name: string): ()
+	local instance = host()
+	if instance == nil then
+		return
+	end
+	local record = ensureRecord(name)
+	local incoming = readAttr(instance, name)
+	record.previous = record.value
+	record.value = incoming
+	record.changes = math.min(record.changes + 1, Config.maxAttributeChanges)
+	record.lastChange = Clock.now()
+	if record.changes >= Config.maxAttributeChanges then
+		say("warn", string.format("attribute %s exceeded change cap (%d); counter pinned", name, Config.maxAttributeChanges))
+	end
+	local message = string.format("attr %s: %s -> %s  (#%d%s)",
+		name,
+		Text.describe(record.previous, 60),
+		Text.describe(incoming, 60),
+		record.changes,
+		if record.priority then ", PRIORITY" else "")
+	if record.priority then
+		say("warn", message)
+	else
+		say("info", message)
+	end
+	fireListeners(name, record)
+end
+
+local function connect(name: string): boolean
+	if State.attributeConns[name] ~= nil then
+		return true
+	end
+	local instance = host()
+	if instance == nil then
+		return false
+	end
+	local ok, conn = pcall(function(): any
+		return (instance :: any):GetAttributeChangedSignal(name):Connect(function()
+			local okHandler = pcall(handleChange, name)
+			if not okHandler then
+				State.consoleErrors += 1
+			end
+		end)
+	end)
+	if ok and conn ~= nil then
+		State.attributeConns[name] = conn
+		return true
+	end
+	return false
+end
+
+function Attr.Watch(name: string): boolean
+	if type(name) ~= "string" or name == "" then
+		return false
+	end
+	ensureRecord(name)
+	local connected = connect(name)
+	if connected then
+		say("info", string.format("watching attribute %s%s", name, if isPriority(name) then " (priority)" else ""))
+		-- Mirror into the core watcher when linked, so /hz-1 records it too.
+		local core = State.core
+		if core ~= nil and State.link.linked and type(core.WatchAttribute) == "function" then
+			pcall(core.WatchAttribute, name)
+		end
+	end
+	return connected
+end
+
+function Attr.Unwatch(name: string): boolean
+	local conn = State.attributeConns[name]
+	if conn == nil then
+		return false
+	end
+	pcall(function()
+		(conn :: any):Disconnect()
+	end)
+	State.attributeConns[name] = nil
+	say("info", "stopped watching attribute " .. name)
+	return true
+end
+
+function Attr.WatchAll(): number
+	local instance = host()
+	if instance == nil then
+		say("warn", "LocalPlayer unavailable; attribute watch deferred")
+		return 0
+	end
+	local ok, attributes = pcall(function(): any
+		return (instance :: any):GetAttributes()
+	end)
+	if not ok or type(attributes) ~= "table" then
+		return 0
+	end
+	local names: { string } = {}
+	for name in pairs(attributes :: { [string]: any }) do
+		if type(name) == "string" then
+			names[#names + 1] = name
+		end
+	end
+	table.sort(names, function(a: string, b: string): boolean
+		return a < b
+	end)
+	local count = 0
+	for _, name in ipairs(names) do
+		if Attr.Watch(name) then
+			count += 1
+		end
+	end
+	say("info", string.format("%d attribute(s) under surveillance", count))
+	return count
+end
+
+function Attr.List(): { AttributeRecord }
+	local out: { AttributeRecord } = {}
+	for _, record in pairs(State.attributes) do
+		out[#out + 1] = {
+			name = record.name,
+			value = record.value,
+			previous = record.previous,
+			changes = record.changes,
+			priority = record.priority,
+			firstSeen = record.firstSeen,
+			lastChange = record.lastChange,
+		}
+	end
+	table.sort(out, function(a: AttributeRecord, b: AttributeRecord): boolean
+		if a.priority ~= b.priority then
+			return a.priority
+		end
+		return a.name < b.name
+	end)
+	return out
+end
+
+function Attr.Get(name: string): any
+	local record = State.attributes[name]
+	if record ~= nil then
+		return record.value
+	end
+	local instance = host()
+	if instance == nil then
+		return nil
+	end
+	return readAttr(instance, name)
+end
+
+function Attr.On(name: string, callback: (AttributeRecord) -> ()): any
+	if type(callback) ~= "function" then
+		return nil
+	end
+	local bucket = State.listeners[name]
+	if bucket == nil then
+		bucket = {}
+		State.listeners[name] = bucket
+	end
+	local token = { fn = callback }
+	bucket[#bucket + 1] = token
+	return token
+end
+
+function Attr.Off(token: any): ()
+	if type(token) ~= "table" then
+		return
+	end
+	for _, bucket in pairs(State.listeners) do
+		for index = #bucket, 1, -1 do
+			if bucket[index] == token then
+				table.remove(bucket, index)
+				return
+			end
+		end
+	end
+end
+
+--- Discovers attributes created after boot, and reconnects deferred watches once
+--- the LocalPlayer appears.
+function Attr.Poll(): number
+	local instance = host()
+	if instance == nil then
+		return 0
+	end
+	local ok, attributes = pcall(function(): any
+		return (instance :: any):GetAttributes()
+	end)
+	if not ok or type(attributes) ~= "table" then
+		return 0
+	end
+	local discovered = 0
+	for name, value in pairs(attributes :: { [string]: any }) do
+		if type(name) == "string" then
+			local record = State.attributes[name]
+			if record == nil then
+				ensureRecord(name)
+				if connect(name) then
+					discovered += 1
+					say("info", string.format("discovered attribute %s = %s", name, Text.describe(value, 60)))
+				end
+			elseif record.value ~= value and State.attributeConns[name] == nil then
+				record.previous = record.value
+				record.value = value
+				record.changes += 1
+				record.lastChange = Clock.now()
+				say("info", string.format("attr %s (poll) = %s", name, Text.describe(value, 60)))
+				fireListeners(name, record)
+			end
+		end
+	end
+	return discovered
+end
+
+--================================================================================
+-- SECTION 7 :: ROUTE REFLECTION
+--================================================================================
+
+local Route = {}
+
+local function probe(owner: any, property: string): any
+	if owner == nil then
+		return nil
+	end
+	local ok, value = pcall(function(): any
+		return (owner :: any)[property]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+function Route.read(): { [string]: any }
+	local player = playerRef()
+	local out: { [string]: any } = {
+		placeId = probe(gameRef, "PlaceId"),
+		gameId = probe(gameRef, "GameId"),
+		jobId = probe(gameRef, "JobId"),
+		placeVersion = probe(gameRef, "PlaceVersion"),
+		userId = probe(player, "UserId"),
+		userName = probe(player, "Name"),
+		displayName = probe(player, "DisplayName"),
+		elapsed = Clock.now() - ORIGIN,
+	}
+
+	if Services.RunService ~= nil then
+		local okStudio, isStudio = pcall(function(): any
+			return (Services.RunService :: any):IsStudio()
+		end)
+		if okStudio and type(isStudio) == "boolean" then
+			out.isStudio = isStudio
+		end
+	end
+
+	if player ~= nil then
+		local okTeam, team = pcall(function(): any
+			return (player :: any).Team
+		end)
+		if okTeam and team ~= nil then
+			local okName, teamName = pcall(function(): any
+				return (team :: any).Name
+			end)
+			if okName and type(teamName) == "string" then
+				out.team = teamName
+			end
+			local okColor, color = pcall(function(): any
+				return (team :: any).TeamColor
+			end)
+			if okColor and color ~= nil then
+				out.teamColor = Text.describe(color, 40)
+			end
+		end
+	end
+	return out
+end
+
+--================================================================================
+-- SECTION 8 :: CORE LINK (three-tier mount)
+--================================================================================
+
+local Link = {}
+
+--- Method expectations. `Console` is a TABLE on /hz-1 (SetANSI / SetRateLimit / Rule),
+--- not a function: checking it with `type(x) == "function"` mis-links a healthy core.
+local EXPECTED_METHODS: { string } = {
+	"IsRunning", "Report", "Metrics", "Audit", "Verify", "Route", "Attributes",
+	"WatchAttribute", "TrackRemote", "Boot", "Shutdown", "Dump", "Teleports",
+	"Sessions", "Search", "Scan",
+}
+
+local function memberPresent(candidate: any, name: string): boolean
+	local ok, value = pcall(function(): any
+		return (candidate :: any)[name]
+	end)
+	if not ok or value == nil then
+		return false
+	end
+	if name == "Console" then
+		return type(value) == "table"
+	end
+	return type(value) == "function"
+end
+
+local function looksLikeCore(candidate: any): boolean
+	if type(candidate) ~= "table" then
+		return false
+	end
+	if type((candidate :: any).Report) ~= "function" then
+		return false
+	end
+	if type((candidate :: any).Metrics) ~= "function" then
+		return false
+	end
+	return true
+end
+
+local function inspect(candidate: any, tier: string): LinkState
+	local missing: { string } = {}
+	local present = 0
+	for _, name in ipairs(EXPECTED_METHODS) do
+		if memberPresent(candidate, name) then
+			present += 1
+		else
+			missing[#missing + 1] = name
+		end
+	end
+	local version: string? = nil
+	local okVersion, versionValue = pcall(function(): any
+		local metrics = (candidate :: any).Metrics()
+		if type(metrics) == "table" then
+			return (metrics :: any).version
+		end
+		return nil
+	end)
+	if okVersion and type(versionValue) == "string" then
+		version = versionValue
+	end
+	-- `Console` is validated separately; it is required but is not a callable member.
+	local consoleOk = memberPresent(candidate, "Console")
+	return {
+		linked = present == #EXPECTED_METHODS and consoleOk,
+		tier = tier,
+		methods = present,
+		missing = missing,
+		coreVersion = version,
+	}
+end
+
+local function fromRegistry(): any
+	local readers: { { name: string, get: () -> any } } = {
+		{
+			name = "getgenv",
+			get = function(): any
+				local fn = resolveGlobal("getgenv")
+				if type(fn) ~= "function" then
+					return nil
+				end
+				local ok, env = pcall(fn)
+				if ok and type(env) == "table" then
+					return (env :: any).hz1
+				end
+				return nil
+			end,
+		},
+		{ name = "_G", get = function(): any
+			return (_G :: any).hz1
+		end },
+		{ name = "shared", get = function(): any
+			return (shared :: any).hz1
+		end },
+	}
+	for _, reader in ipairs(readers) do
+		local ok, candidate = pcall(reader.get)
+		if ok and looksLikeCore(candidate) then
+			say("info", "registry hit via " .. reader.name .. ".hz1")
+			return candidate
+		end
+	end
+	return nil
+end
+
+local function selfFetch(): any
+	if not Config.autoLoadCore then
+		return nil
+	end
+	local httpGet = resolveGlobal("HttpGet")
+	if type(httpGet) ~= "function" then
+		say("warn", "no core handle and HttpGet is unavailable; running standalone")
+		return nil
+	end
+	local okFetch, source = pcall(httpGet, Config.coreUrl)
+	if not okFetch or type(source) ~= "string" then
+		say("warn", "self-fetch of /hz-1 failed: " .. tostring(source))
+		return nil
+	end
+	local loader: any = resolveGlobal("loadstring")
+	if loader == nil then
+		loader = resolveGlobal("load")
+	end
+	if type(loader) ~= "function" then
+		say("warn", "loadstring unavailable; cannot self-fetch /hz-1")
+		return nil
+	end
+	local okCompile, chunk = pcall(loader, source, "=hz-1")
+	if not okCompile or type(chunk) ~= "function" then
+		say("warn", "compile of /hz-1 failed: " .. tostring(chunk))
+		return nil
+	end
+	local okRun, api = pcall(chunk)
+	if not okRun or not looksLikeCore(api) then
+		say("warn", "execution of /hz-1 failed: " .. tostring(api))
+		return nil
+	end
+	say("info", "self-fetched and booted /hz-1")
+	return api
+end
+
+function Link.mount(handle: any?): LinkState
+	local candidate: any = handle
+	local tier = "argument"
+
+	if not looksLikeCore(candidate) then
+		candidate = fromRegistry()
+		tier = "registry"
+	end
+	if not looksLikeCore(candidate) then
+		candidate = selfFetch()
+		tier = "self-fetch"
+	end
+
+	if not looksLikeCore(candidate) then
+		State.core = nil
+		State.link = {
+			linked = false,
+			tier = "standalone",
+			methods = 0,
+			missing = EXPECTED_METHODS,
+			coreVersion = nil,
+		}
+		say("warn", "standalone mode: attribute surveillance and route reflection remain active")
+		return State.link
+	end
+
+	State.core = candidate
+	State.link = inspect(candidate, tier)
+	say("info", string.format("core linked via %s (v%s, %d/%d methods)",
+		tier,
+		tostring(State.link.coreVersion),
+		State.link.methods,
+		#EXPECTED_METHODS))
+
+	if not memberPresent(candidate, "Console") then
+		State.link.missing[#State.link.missing + 1] = "Console"
+	end
+	if #State.link.missing > 0 then
+		say("warn", "core is missing: " .. table.concat(State.link.missing, ", "))
+	end
+
+	-- Re-attach the core watcher for anything already tracked locally.
+	pcall(function()
+		for _, record in pairs(State.attributes) do
+			if type((candidate :: any).WatchAttribute) == "function" then
+				(candidate :: any).WatchAttribute(record.name)
+			end
+		end
+	end)
+
+	return State.link
+end
+
+function Link.unlink(): ()
+	if State.core ~= nil then
+		pcall(function()
+			local core = asAny(State.core)
+			if type(core) == "table" and type(core.UnwatchAttribute) == "function" then
+				for _, record in pairs(State.attributes) do
+					(core.UnwatchAttribute :: any)(record.name)
+				end
+			end
+		end)
+	end
+	State.core = nil
+	State.link = {
+		linked = false,
+		tier = "standalone",
+		methods = 0,
+		missing = EXPECTED_METHODS,
+		coreVersion = nil,
+	}
+	say("info", "detached from /hz-1; continuing standalone")
+end
+
+--================================================================================
+-- SECTION 9 :: COMMAND INTERFACE
+--================================================================================
+-- A text command parser. Deliberately no GUI: nothing is inserted into the
+-- render tree, so the panel cannot be detected by inspecting PlayerGui and cannot
+-- interfere with the client's rendering loop.
+
+local Panel: any = nil
+local Commands = {}
+
+local registry: { [string]: Command } = {}
+local order: { string } = {}
+
+local function define(name: string, desc: string, usage: string, fn: (args: { string }) -> (boolean, any)): ()
+	local key = string.lower(name)
+	if registry[key] == nil then
+		order[#order + 1] = key
+	end
+	registry[key] = {
+		name = key,
+		desc = desc,
+		usage = usage,
+		run = fn,
+	}
+end
+
+local function panelText(): string
+	if Panel == nil then
+		return "HZ-2 panel not ready"
+	end
+	local ok, result = pcall(Panel.render)
+	if ok and type(result) == "string" then
+		return result
+	end
+	return "HZ-2 panel unavailable"
+end
+
+local function requireCore(): (any?, string?)
+	if State.core == nil or not State.link.linked then
+		return nil, "not linked to /hz-1 (run :link first)"
+	end
+	return State.core, nil
+end
+
+local function coreCall(method: string, ...: any): (boolean, any)
+	local core, reason = requireCore()
+	if core == nil then
+		return false, reason
+	end
+	local fn = core[method]
+	if type(fn) ~= "function" then
+		return false, "core has no method '" .. method .. "'"
+	end
+	local packed = table.pack(...)
+	local ok, result = pcall(function(): any
+		return fn(table.unpack(packed, 1, packed.n))
+	end)
+	if not ok then
+		return false, tostring(result)
+	end
+	return true, result
+end
+
+-- ---- core-backed commands (report `unlinked` cleanly when standalone) ----------
+
+define("status", "One-line link + activity summary", ":status", function(): (boolean, any)
+	local numbers = {
+		linked = State.link.linked,
+		tier = State.link.tier,
+		attrs = 0,
+	}
+	for _ in pairs(State.attributes) do
+		numbers.attrs += 1
+	end
+	if State.link.linked then
+		local okMetrics, metrics = coreCall("Metrics")
+		if okMetrics and type(metrics) == "table" then
+			local m: any = metrics
+			say("info", string.format(
+				"linked(%s) v%s | records=%s buffered=%s errors=%s remotes=%s attrs=%d",
+				State.link.tier,
+				tostring(m.version),
+				Text.group(m.records or 0),
+				tostring(m.buffered),
+				tostring(m.errors),
+				tostring(m.remotes),
+				numbers.attrs
+			))
+		end
+	else
+		say("info", string.format("standalone | attrs=%d | core=unlinked", numbers.attrs))
+	end
+	return true, numbers
+end)
+
+define("report", "Full /hz-1 diagnostic report", ":report", function(): (boolean, any)
+	local ok, result = coreCall("Report")
+	if not ok then
+		return false, result
+	end
+	print(tostring(result))
+	return true, result
+end)
+
+define("metrics", "Machine-readable core metrics", ":metrics", function(): (boolean, any)
+	local ok, result = coreCall("Metrics")
+	if not ok then
+		return false, result
+	end
+	print(Text.describe(result, 2048))
+	return true, result
+end)
+
+define("audit", "Tail of the hash-chained audit ring", ":audit [count]", function(args: { string }): (boolean, any)
+	local limit = tonumber(args[1] or "") or 20
+	local ok, result = coreCall("Audit", math.floor(limit))
+	if not ok then
+		return false, result
+	end
+	if type(result) == "table" then
+		for _, row in ipairs(result :: { any }) do
+			print(string.format("  #%d [%s] %-5s %-20s @%s",
+				row.seq, row.channel, string.upper(row.level), row.event, row.tostring))
+		end
+	end
+	return true, result
+end)
+
+define("verify", "Verify the ring hash chain", ":verify", function(): (boolean, any)
+	local ok, result = coreCall("Verify")
+	if not ok then
+		return false, result
+	end
+	local valid = result == true
+	say(if valid then "info" else "error", if valid then "chain VERIFIED" else "chain BROKEN")
+	return valid, result
+end)
+
+define("remotes", "Tracked remote inventory", ":remotes", function(): (boolean, any)
+	local ok, result = coreCall("Remotes")
+	if not ok then
+		return false, result
+	end
+	local stats = result :: any
+	if type(stats) ~= "table" then
+		return false, "unexpected payload"
+	end
+	local items = stats :: { any }
+	if #items == 0 then
+		say("info", "no remotes tracked")
+	end
+	for _, row in ipairs(items) do
+		local entry = row :: any
+		print(string.format("  %-44s %-18s fire=%d invoke=%d recv=%d err=%d",
+			Text.cut(tostring(entry.path), 44),
+			tostring(entry.className),
+			tonumber(entry.fireCalls) or 0,
+			tonumber(entry.invokeCalls) or 0,
+			tonumber(entry.receivedEvents) or 0,
+			tonumber(entry.errors) or 0))
+	end
+	return true, #items
+end)
+
+define("scan", "Re-scan roots for remotes", ":scan", function(): (boolean, any)
+	local ok, result = coreCall("Scan")
+	if not ok then
+		return false, result
+	end
+	say("info", string.format("scan complete: %s remote(s)", tostring(result)))
+	return true, result
+end)
+
+define("route", "Route reflection (core when linked, local otherwise)", ":route", function(): (boolean, any)
+	local route: any = nil
+	if State.link.linked then
+		local ok, result = coreCall("Route")
+		if ok then
+			route = result
+		end
+	end
+	if route == nil then
+		route = Route.read()
+	end
+	for _, key in ipairs({ "placeId", "gameId", "jobId", "placeVersion", "isStudio", "userId", "team" }) do
+		say("info", string.format("route.%s = %s", key, Text.describe((route :: any)[key], 60)))
+	end
+	return true, route
+end)
+
+define("teleports", "Captured teleport transitions", ":teleports", function(): (boolean, any)
+	local ok, result = coreCall("Teleports")
+	if not ok then
+		return false, result
+	end
+	local rows = result :: any
+	if type(rows) ~= "table" or #rows == 0 then
+		say("info", "no teleport events captured")
+		return true, 0
+	end
+	for _, row in ipairs(rows) do
+		local entry = row :: any
+		print(string.format("  [%s] %-6s place=%s result=%s %s",
+			Text.ms(tonumber(entry.clock) or 0), tostring(entry.kind),
+			tostring(entry.placeId), tostring(entry.resultCode), tostring(entry.message)))
+	end
+	return true, #rows
+end)
+
+define("fire", "Fire a remote through the core router", ":fire <path> [json-ish args]", function(args: { string }): (boolean, any)
+	if args[1] == nil then
+		return false, "usage: :fire <RemotePath> [arg]"
+	end
+	local core, reason = requireCore()
+	if core == nil then
+		return false, reason
+	end
+	local target = args[1]
+	local resolved: any = nil
+	local function resolve(root: any)
+		if root == nil then return nil end
+		local ok, found = pcall(function(): any
+			local current = root
+			for segment in string.gmatch(target, "[^%.]+") do
+				if current == nil then return nil end
+				current = (current :: any)[segment]
+			end
+			return current
+		end)
+		if ok then return found end
+		return nil
+	end
+	resolved = resolve(getService("ReplicatedStorage")) or resolve(playerRef())
+	if resolved == nil or not isInstance(resolved) then
+		return false, "remote not found: " .. target
+	end
+	local ok, result = coreCall("RoutedFire", resolved, table.unpack(args, 2))
+	if not ok then
+		return false, result
+	end
+	return true, result
+end)
+
+define("boot", "Boot /hz-1 core", ":boot", function(): (boolean, any)
+	local ok, result = coreCall("Boot")
+	if not ok then
+		return false, result
+	end
+	return result == true, result
+end)
+
+define("shutdown", "Shut down /hz-1 core", ":shutdown", function(): (boolean, any)
+	local ok, result = coreCall("Shutdown")
+	if not ok then
+		return false, result
+	end
+	return result == true, result
+end)
+
+define("anon", "Toggle ANSI palette on the core console", ":anon [on|off]", function(args: { string }): (boolean, any)
+	local core, reason = requireCore()
+	if core == nil then
+		return false, reason
+	end
+	local desired = (args[1] or "on") == "on"
+	local ok = pcall(function()
+		(core :: any).Console.SetANSI(desired)
+	end)
+	return ok, desired
+end)
+
+define("limit", "Set core console rate limit", ":limit <lines/sec>", function(args: { string }): (boolean, any)
+	local core, reason = requireCore()
+	if core == nil then
+		return false, reason
+	end
+	local perSecond = tonumber(args[1] or "")
+	if perSecond == nil then
+		return false, "usage: :limit <lines/sec>"
+	end
+	local ok = pcall(function()
+		(core :: any).Console.SetRateLimit(math.floor(perSecond))
+	end)
+	return ok, perSecond
+end)
+
+-- ---- local commands (work in every mode) --------------------------------------
+
+define("help", "List available commands", ":help", function(): (boolean, any)
+	local lines: { string } = { "HZ-2 command panel:" }
+	for _, key in ipairs(order) do
+		local command = registry[key]
+		if command ~= nil then
+			lines[#lines + 1] = string.format("  %-22s %s", command.usage, command.desc)
+		end
+	end
+	print(table.concat(lines, "\n"))
+	return true, #order
+end)
+
+define("link", "Attempt to bind /hz-1 (all three tiers)", ":link", function(): (boolean, any)
+	local state = Link.mount(nil)
+	return state.linked, state
+end)
+
+define("unlink", "Detach from /hz-1 and continue standalone", ":unlink", function(): (boolean, any)
+	Link.unlink()
+	return true, State.link
+end)
+
+define("attr", "Attribute table", ":attr [name]", function(args: { string }): (boolean, any)
+	if args[1] ~= nil then
+		local value = Attr.Get(args[1])
+		say("info", string.format("%s = %s", args[1], Text.describe(value, 120)))
+		return true, value
+	end
+	local rows = Attr.List()
+	if #rows == 0 then
+		say("info", "no attributes tracked (run :attrall)")
+		return true, 0
+	end
+	for _, row in ipairs(rows) do
+		print(string.format("  %s %-22s = %-34s changes=%d",
+			if row.priority then "*" else " ",
+			row.name,
+			Text.cut(Text.describe(row.value, 34), 34),
+			row.changes))
+	end
+	return true, #rows
+end)
+
+define("attrall", "Watch every local player attribute", ":attrall", function(): (boolean, any)
+	local count = Attr.WatchAll()
+	return count >= 0, count
+end)
+
+define("attrwatch", "Watch one attribute", ":attrwatch <name>", function(args: { string }): (boolean, any)
+	if args[1] == nil then
+		return false, "usage: :attrwatch <name>"
+	end
+	return Attr.Watch(args[1]), args[1]
+end)
+
+define("attrunwatch", "Stop watching one attribute", ":attrunwatch <name>", function(args: { string }): (boolean, any)
+	if args[1] == nil then
+		return false, "usage: :attrunwatch <name>"
+	end
+	return Attr.Unwatch(args[1]), args[1]
+end)
+
+define("caps", "Executor capability probe results", ":caps", function(): (boolean, any)
+	local report = Capabilities.get()
+	say("info", string.format("capability probe: %d/%d present (%.1f%%)",
+		report.detected, report.total, report.coverage))
+	print("  present: " .. (if #report.present > 0 then table.concat(report.present, ", ") else "(none)"))
+	print("  missing: " .. Text.cut(table.concat(report.missing, ", "), 300))
+	return true, report
+end)
+
+define("priority", "Show or set priority attribute keys", ":priority [k1,k2,...]", function(args: { string }): (boolean, any)
+	if args[1] ~= nil then
+		local names: { string } = {}
+		for piece in string.gmatch(args[1], "[^,]+") do
+			names[#names + 1] = piece
+		end
+		Config.priorityKeys = names
+		rebuildPriority()
+		for _, record in pairs(State.attributes) do
+			record.priority = isPriority(record.name)
+		end
+	end
+	say("info", "priority keys: " .. table.concat(Config.priorityKeys, ", "))
+	return true, Config.priorityKeys
+end)
+
+define("panel", "Full state reflection panel", ":panel", function(): (boolean, any)
+	print(Panel.render())
+	return true, true
+end)
+
+define("clear", "Clear the core audit buffer", ":clear", function(): (boolean, any)
+	local ok, result = coreCall("Clear")
+	if not ok then
+		return false, result
+	end
+	return true, result
+end)
+
+--- Register a third-party command. Presented so downstream modules (/hz-3 and
+--- beyond) extend the panel without forking this file.
+function Commands.register(name: string, desc: string, usage: string, fn: (args: { string }) -> (boolean, any)): boolean
+	if type(name) ~= "string" or name == "" or type(fn) ~= "function" then
+		return false
+	end
+	define(name, desc, usage, fn)
+	return true
+end
+
+function Commands.list(): { Command }
+	local out: { Command } = {}
+	for _, key in ipairs(order) do
+		local command = registry[key]
+		if command ~= nil then
+			out[#out + 1] = command
+		end
+	end
+	return out
+end
+
+--- Parse and dispatch. Quoted tokens are supported so arguments may contain
+--- spaces. Every command runs inside its own containment boundary.
+function Commands.exec(line: string): (boolean, any)
+	if type(line) ~= "string" or line == "" then
+		return false, "empty command"
+	end
+	-- Tokenise with a SINGLE positional capture. A multi-capture gmatch cannot work
+	-- here: in a generic for, a nil first value terminates the loop, and an
+	-- unmatched alternative yields nil by definition.
+	local tokens: { string } = {}
+	local position = 1
+	while position <= #line do
+		local openQuote = string.find(line, "\"", position, true)
+		local firstWord = string.find(line, "%S", position)
+		if firstWord == nil then
+			break
+		end
+		if openQuote ~= nil and openQuote <= firstWord then
+			local closeQuote = string.find(line, "\"", openQuote + 1, true)
+			if closeQuote == nil then
+				tokens[#tokens + 1] = string.sub(line, openQuote + 1)
+				break
+			end
+			tokens[#tokens + 1] = string.sub(line, openQuote + 1, closeQuote - 1)
+			position = closeQuote + 1
+		else
+			local stop = string.find(line, "%s", firstWord)
+			if stop == nil then
+				tokens[#tokens + 1] = string.sub(line, firstWord)
+				break
+			end
+			tokens[#tokens + 1] = string.sub(line, firstWord, stop - 1)
+			position = stop
+		end
+	end
+	if #tokens == 0 then
+		return false, "no command"
+	end
+	local name = string.lower(tokens[1])
+	if string.sub(name, 1, 1) == ":" then
+		name = string.sub(name, 2)
+	end
+	local command = registry[name]
+	if command == nil then
+		return false, "unknown command '" .. name .. "' (try :help)"
+	end
+	local args: { string } = {}
+	for index = 2, #tokens do
+		args[#args + 1] = tokens[index]
+	end
+	local ok, first, second = pcall(command.run, args)
+	if not ok then
+		say("error", string.format("command '%s' raised: %s", name, tostring(first)))
+		return false, first
+	end
+	return first == true, second
+end
+
+--================================================================================
+-- SECTION 10 :: PANEL RENDERING
+--================================================================================
+
+Panel = {}
+
+function Panel.render(): string
+	local link = State.link
+	local caps = Capabilities.get()
+	local route = Route.read()
+	local width = 78
+	local lines: { string } = {}
+	local function rule(title: string)
+		lines[#lines + 1] = string.rep("-", width)
+		if title ~= "" then
+			lines[#lines + 1] = "  " .. title
+		end
+	end
+
+	lines[#lines + 1] = string.rep("=", width)
+	lines[#lines + 1] = "  HZ-2  ::  CONTROL PANEL"
+	lines[#lines + 1] = string.rep("=", width)
+	lines[#lines + 1] = string.format("  link      : %s (tier=%s, %d methods%s)",
+		if link.linked then "LINKED" else "STANDALONE",
+		link.tier,
+		link.methods,
+		if link.coreVersion then ", core v" .. link.coreVersion else "")
+	if #link.missing > 0 then
+		lines[#lines + 1] = "  missing   : " .. Text.cut(table.concat(link.missing, ", "), 60)
+	end
+	lines[#lines + 1] = string.format("  uptime    : %s", Text.ms(Clock.now() - ORIGIN))
+	lines[#lines + 1] = string.format("  place     : %s   job: %s", tostring(route.placeId), tostring(route.jobId))
+	lines[#lines + 1] = string.format("  player    : %s (uid %s)  team: %s",
+		tostring(route.displayName or route.userName),
+		tostring(route.userId),
+		tostring(route.team))
+	lines[#lines + 1] = string.format("  caps      : %d/%d present (%.1f%%)",
+		caps.detected, caps.total, caps.coverage)
+
+	rule("attributes")
+	local rows = Attr.List()
+	if #rows == 0 then
+		lines[#lines + 1] = "    (none tracked -- run :attrall)"
+	end
+	for index, row in ipairs(rows) do
+		if index > 14 then
+			lines[#lines + 1] = string.format("    ... %d more", #rows - 14)
+			break
+		end
+		lines[#lines + 1] = string.format("    %s %-20s = %-30s chg=%d",
+			if row.priority then "*" else " ",
+			row.name,
+			Text.cut(Text.describe(row.value, 30), 30),
+			row.changes)
+	end
+
+	if link.linked and State.core ~= nil then
+		rule("core metrics")
+		local okMetrics, metrics = pcall(function(): any
+			return (State.core :: any).Metrics()
+		end)
+		if okMetrics and type(metrics) == "table" then
+			local m: any = metrics
+			lines[#lines + 1] = string.format(
+				"    records=%s buffered=%s dropped=%s errors=%s",
+				Text.group(m.records or 0), tostring(m.buffered), tostring(m.dropped), tostring(m.errors))
+			lines[#lines + 1] = string.format(
+				"    remotes=%s fire=%s invoke=%s inbound=%s wraps=%s",
+				tostring(m.remotes),
+				Text.group((m.counters or {}).fireCalls or 0),
+				Text.group((m.counters or {}).invokeCalls or 0),
+				Text.group((m.counters or {}).inboundEvents or 0),
+				tostring((m.counters or {}).remoteWraps or 0))
+			lines[#lines + 1] = string.format("    integrity=%s",
+				if m.integrity then "VERIFIED" else "BREAK DETECTED")
+		else
+			lines[#lines + 1] = "    (metrics unavailable)"
+		end
+	end
+
+	rule("commands")
+	lines[#lines + 1] = "    " .. Text.cut(table.concat((function()
+		local names: { string } = {}
+		for _, key in ipairs(order) do
+			names[#names + 1] = ":" .. key
+		end
+		return names
+	end)(), " "), 300)
+
+	lines[#lines + 1] = string.rep("=", width)
+	return table.concat(lines, "\n")
+end
+
+--================================================================================
+-- SECTION 11 :: PUBLIC API
+--================================================================================
+
+local API: HzControlAPI
+
+--- Built as a local, then wired onto the API table. Self-referencing through
+--- `API.x` before the table is assigned is an infinite recursion.
+local function buildSnapshot(): Snapshot
+	local coreSnapshot: { [string]: any }? = nil
+	if State.link.linked then
+		local okMetrics, metrics = pcall(function(): any
+			return (State.core :: any).Metrics()
+		end)
+		if okMetrics and type(metrics) == "table" then
+			coreSnapshot = metrics :: { [string]: any }
+		end
+	end
+	return {
+		link = State.link,
+		caps = Capabilities.get(),
+		attributes = Attr.List(),
+		route = Route.read(),
+		core = coreSnapshot,
+		uptime = Clock.now() - ORIGIN,
+	}
+end
+
+API = {
+	Mount = function(handle: any?): LinkState
+		local ok, result = pcall(Link.mount, handle)
+		if not ok then
+			say("error", "mount failed: " .. tostring(result))
+			return State.link
+		end
+		return result
+	end,
+
+	Unlink = function(): ()
+		pcall(Link.unlink)
+	end,
+
+	Link = function(): LinkState
+		return State.link
+	end,
+
+	Core = function(): any
+		return State.core
+	end,
+
+	Snapshot = function(): Snapshot
+		local ok, result = pcall(buildSnapshot)
+		if ok and type(result) == "table" then
+			return result
+		end
+		say("error", "snapshot failed: " .. tostring(result))
+		return {
+			link = State.link,
+			caps = Capabilities.get(),
+			attributes = {},
+			route = {},
+			core = nil,
+			uptime = Clock.now() - ORIGIN,
+		}
+	end,
+
+	Panel = function(): string
+		return panelText()
+	end,
+
+	Report = function(): string
+		if State.link.linked then
+			local ok, result = pcall(function(): any
+				return (State.core :: any).Report()
+			end)
+			if ok and type(result) == "string" then
+				return result
+			end
+		end
+		return panelText()
+	end,
+
+	Attr = {
+		Watch = function(name: string): boolean
+			local ok, result = pcall(Attr.Watch, name)
+			return ok and result == true
+		end,
+		Unwatch = function(name: string): boolean
+			local ok, result = pcall(Attr.Unwatch, name)
+			return ok and result == true
+		end,
+		WatchAll = function(): number
+			local ok, result = pcall(Attr.WatchAll)
+			if ok and type(result) == "number" then
+				return result
+			end
+			return 0
+		end,
+		List = function(): { AttributeRecord }
+			local ok, result = pcall(Attr.List)
+			if ok and type(result) == "table" then
+				return result
+			end
+			return {}
+		end,
+		Get = function(name: string): any
+			local ok, result = pcall(Attr.Get, name)
+			if ok then
+				return result
+			end
+			return nil
+		end,
+		On = function(name: string, callback: (AttributeRecord) -> ()): any
+			local ok, result = pcall(Attr.On, name, callback)
+			if ok then
+				return result
+			end
+			return nil
+		end,
+		Off = function(token: any): ()
+			pcall(Attr.Off, token)
+		end,
+		Poll = function(): number
+			local ok, result = pcall(Attr.Poll)
+			if ok and type(result) == "number" then
+				return result
+			end
+			return 0
+		end,
+	},
+
+	SetPriority = function(names: { string }): ()
+		if type(names) ~= "table" then
+			return
+		end
+		Config.priorityKeys = names
+		rebuildPriority()
+		for _, record in pairs(State.attributes) do
+			record.priority = isPriority(record.name)
+		end
+	end,
+
+	AddPriority = function(name: string): ()
+		if type(name) ~= "string" or name == "" then
+			return
+		end
+		Config.priorityKeys[#Config.priorityKeys + 1] = name
+		rebuildPriority()
+	end,
+
+	Route = function(): { [string]: any }
+		local ok, result = pcall(Route.read)
+		if ok and type(result) == "table" then
+			return result
+		end
+		return {}
+	end,
+
+	Caps = function(): CapabilityReport
+		return Capabilities.get()
+	end,
+
+	Exec = function(line: string): (boolean, any)
+		local ok, first, second = pcall(Commands.exec, line)
+		if not ok then
+			return false, tostring(first)
+		end
+		return first == true, second
+	end,
+
+	Commands = function(): { Command }
+		return Commands.list()
+	end,
+
+	Register = function(name: string, desc: string, usage: string, fn: (args: { string }) -> (boolean, any)): boolean
+		return Commands.register(name, desc, usage, fn)
+	end,
+
+	Config = function(): { [string]: any }
+		return table.clone(Config)
+	end,
+
+	Configure = function(overrides: { [string]: any }): boolean
+		local ok = pcall(function()
+			for key, value in pairs(overrides) do
+				(Config :: any)[key] = value
+			end
+			rebuildPriority()
+			capabilityCache = nil
+		end)
+		if not ok then
+			return false
+		end
+		return true
+	end,
+}
+
+--================================================================================
+-- SECTION 12 :: SELF-CONTAINED EXECUTION
+--================================================================================
+-- The main chunk is vararg, so `loadstring(game:HttpGet(HZ2_URL))(core)` delivers
+-- a /hz-1 handle with no global read at all. Fall through the tiers otherwise.
+
+-- Capture the chunk's varargs ONCE at top level; a nested closure cannot use `...`.
+local injectedHandle: any = ...
+local mountOk, mountErr = pcall(function()
+	Link.mount(injectedHandle)
+end)
+if not mountOk then
+	State.consoleErrors += 1
+	say("error", "mount contained failure: " .. tostring(mountErr))
+end
+
+--- Publish the companion handle for a future /hz-3. This is the single shared
+--- state write in the module and can be disabled with Configure({ publishRegistry = false }).
+if Config.publishRegistry then
+	pcall(function()
+		publishGlobal(Config.registryKey, API)
+	end)
+end
+
+--- Poll thread: attribute discovery and deferred-watch recovery.
+if taskFn ~= nil and Config.pollInterval > 0 then
+	local okSpawn = pcall(function()
+		State.pollThread = taskFn.spawn(function()
+			while State.running do
+				taskFn.wait(Config.pollInterval)
+				pcall(Attr.Poll)
+			end
+		end)
+	end)
+	if not okSpawn then
+		say("debug", "poll thread unavailable; :attrall remains manual")
+	end
+end
+
+say("info", string.format("hz-2 ready | mode=%s | commands=%d | caps=%d/%d",
+	if State.link.linked then "linked" else "standalone",
+	#Commands.list(),
+	Capabilities.get().detected,
+	Capabilities.get().total))
+
+return API
